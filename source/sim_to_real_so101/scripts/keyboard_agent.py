@@ -55,6 +55,16 @@ parser.add_argument(
     "--repo_root", type=str, default=None, help="Repository root to store the dataset."
 )
 parser.add_argument(
+    "--action_log",
+    type=str,
+    default=None,
+    help=(
+        "Directory to save simple per-step joint-target logs (.npz, no `lerobot` dependency) "
+        "each time recording is toggled off with 'S' (or implicitly via 'R'). Independent of "
+        "--repo_id/--repo_root/--task_name -- replay these with replay_agent.py."
+    ),
+)
+parser.add_argument(
     "--save_mp4",
     action="store_true",
     default=False,
@@ -89,6 +99,7 @@ simulation_app = app_launcher.app
 
 
 import gymnasium as gym
+import numpy as np
 import torch
 
 
@@ -133,6 +144,8 @@ def main():
     print(f"[INFO]: Click 'R' to reset the world")
     print(f"[INFO]: Click 'S' to start/stop recording; 'R' will also stop recording")
     print(f"[INFO]: Click 'C' to cancel an in-progress recording")
+    if args_cli.action_log:
+        print(f"[INFO]: Action log enabled -> {args_cli.action_log} (one .npz per 'S' start/stop)")
 
     # reset environment
     env.reset()
@@ -158,6 +171,16 @@ def main():
 
     # Allocate action tensor
     actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+
+    # Lightweight action-log recording (no `lerobot` dependency): reuses the
+    # same 'S'/'R' recording toggle as the LeRobot dataset path below, but
+    # just appends the per-step joint target and dumps a .npz on stop.
+    action_log_mode = args_cli.action_log is not None
+    action_log_buffer = []
+    action_log_episode_index = 0
+    was_recording = False
+    if action_log_mode:
+        os.makedirs(args_cli.action_log, exist_ok=True)
 
     # Recording dataset
     if all([args_cli.repo_id, args_cli.repo_root, args_cli.task_name]):
@@ -215,6 +238,25 @@ def main():
             actions[:, :] = targets
 
             obs, _, _, _, _ = env.step(actions)
+
+            if action_log_mode:
+                if keyboard_control.recording:
+                    action_log_buffer.append(targets.detach().cpu().numpy().copy())
+                elif was_recording:
+                    # 'recording' just flipped off (via 'S' or 'R') -> flush this episode
+                    if action_log_buffer:
+                        action_log_episode_index += 1
+                        log_path = os.path.join(
+                            args_cli.action_log, f"episode_{action_log_episode_index:03d}.npz"
+                        )
+                        np.savez(
+                            log_path,
+                            actions=np.stack(action_log_buffer).astype(np.float32),
+                            joint_names=np.array(JointJogKeyboardControl.JOINT_ORDER),
+                        )
+                        print(f"[INFO]: Saved action log ({len(action_log_buffer)} steps) -> {log_path}")
+                    action_log_buffer = []
+                was_recording = keyboard_control.recording
 
             if keyboard_control.reset_world:
                 keyboard_control.reset_world = False

@@ -13,10 +13,9 @@ your own machine.
 ## 1. The three tasks
 
 1. **Log into Omniverse and confirm Isaac Sim can simulate the SO-101 arm doing pick-and-place via
-   teleoperation.** Status: sim confirmed working (§5a); keyboard-jog teleop script written and two
-   real bugs found + fixed via automated smoke testing (§7) — **still needs your hands on the
-   keyboard** for the one thing that can't be automated: confirming the arm actually moves when you
-   hold a jog key.
+   teleoperation.** **Status: done and confirmed.** Sim confirmed working (§5a); keyboard-jog teleop
+   script written, two real bugs found + fixed via automated smoke testing, and now **visually
+   confirmed working** — holding a jog key in the viewport moves the arm (§7).
 2. **(Aakash)** Open USD Composer, check for existing scene templates, and build a simple indoor
    environment scene. **Status: done, see §10** — built programmatically rather than by hand in
    Composer's GUI (this session can't drive a GUI app); still needs a visual look-over in Composer.
@@ -455,6 +454,80 @@ are never called, so no physical arm is needed even then), and `real_action` for
 is computed from the commanded target via `get_raw_actions_from_radians(targets)` rather than read
 from real hardware.
 
+### Replaying a recorded trajectory: `--action_log` + `replay_agent.py`
+
+For replaying a teleop episode back into the sim (open-loop) without needing the `lerobot` package
+at all, `keyboard_agent.py` has a second, independent recording path alongside the LeRobot dataset
+one above:
+
+- `--action_log DIR` — while `keyboard_control.recording` is on (same `'S'`/`'R'` toggle as the
+  LeRobot path, but this one needs no `--repo_id`/`--repo_root`/`--task_name`), every physics step
+  appends the current per-joint target tensor to a buffer. The moment recording flips off (`'S'`
+  again, or `'R'`), the buffer is saved as `episode_NNN.npz` in `DIR` — just two arrays,
+  `actions` (T, 6) and `joint_names`, no `lerobot` dependency at all. Multiple stop/starts in one
+  session save multiple numbered episodes.
+- [replay_agent.py](../source/sim_to_real_so101/scripts/replay_agent.py) — a new sibling script that
+  loads one `episode_NNN.npz`, checks its `joint_names` match `JointJogKeyboardControl.JOINT_ORDER`
+  (guards against a log from some future, differently-ordered version of the script), then steps the
+  environment through the recorded actions in order, open-loop, `--num_repeats` times. `'R'` restarts
+  the current replay from step 0.
+
+```powershell
+Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.keyboard_agent --task Lerobot-So101-Teleop-Vials-To-Rack --action_log C:\ilab\action_logs
+Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.replay_agent --task Lerobot-So101-Teleop-Vials-To-Rack --action_log C:\ilab\action_logs\episode_001.npz
+```
+
+**Verified end-to-end**: since generating a real recording needs a human holding keys down (something
+this assistant can't do), `replay_agent.py` was instead smoke-tested against a synthetic 90-step
+`.npz` (a small, safe gripper open/close gesture, other 5 joints held at the default reset pose,
+built directly with `numpy` — no sim involved in generating it). The replay ran clean end-to-end:
+loaded the log, built the environment with no errors, stepped through all 90/90 recorded actions at
+~22 steps/sec, then correctly entered its "stay open until closed" idle loop. This confirms the
+mechanics (npz round-trip, joint-order validation, env stepping) work; it does **not** confirm what a
+real recorded jogging session looks like when replayed — that still needs you to actually record one.
+
+### Replaying the same trajectory in USD Composer, without Isaac Lab
+
+`replay_agent.py` above only runs through the `Y:\e` Isaac Lab install — Composer is a separate Kit
+app with no `isaaclab_tasks`, no gym env, no way to attach to it (Isaac Lab always launches its own
+Kit process via `AppLauncher`; it doesn't plug into an already-running one). Getting the same
+recorded trajectory to play inside Composer specifically needed a different mechanism.
+
+**How**: every SO-101 joint in `SO-ARM101-USD.usd` is a `PhysicsRevoluteJoint` with a
+`PhysicsDriveAPI:angular` applying `drive:angular:physics:targetPosition` — confirmed by direct
+inspection to be authored in **degrees**, matching each joint's `lowerLimit`/`upperLimit` exactly
+(e.g. `Rotation`'s `[-110, 110]` matches `lerobot_interface.py`'s `SO101_USD_MAPPING` shoulder_pan
+range). This is a genuine PhysX drive target, not a kinematic transform, so it needs Composer's own
+physics simulation (Play button) running to actually move the joint — but that also means it behaves
+like a real physics-driven arm rather than a pre-baked animation.
+
+[`usd-composer-stages/bake_action_log_to_usd_animation.py`](../usd-composer-stages/bake_action_log_to_usd_animation.py)
+takes an `episode_NNN.npz` (from `keyboard_agent.py --action_log`, converts each frame's radians to
+degrees, and authors one time sample per frame on `drive:angular:physics:targetPosition` for all 6
+joints — as overrides on a plain reference to `SO-ARM101-USD.usd` (the original asset file is never
+touched), at 60 fps (matching `keyboard_agent.py`'s per-step cadence: Isaac Lab's environment
+step-size for this task is 1/60 s). Run it with the same throwaway `usd-core` venv as
+`build_indoor_scene.py` (§10):
+
+```powershell
+usdenv\Scripts\python.exe usd-composer-stages\bake_action_log_to_usd_animation.py C:\ilab\action_logs\episode_001.npz usd-composer-stages\replay-episode_001.usd
+```
+
+Then open the output file in Composer and hit **Play** to run physics simulation — the arm should
+drive through the recorded trajectory using its own PD drive gains (`stiffness=17.8`,
+`damping=0.6`, `maxForce=10` baked into the raw file — noticeably different from the tuned actuator
+values in `so101.py`'s `SO101_CFG`, since those are set at the Isaac Lab layer and never touch the
+raw USD, so expect softer/different-feeling motion than in Isaac Sim). The robot's own
+`root_joint` (a `PhysicsFixedJoint`) already anchors its base in the raw file, so no extra pinning
+should be needed.
+
+**Verified programmatically, not yet visually**: the bake script was run against the same synthetic
+90-step test log used above, and every authored time sample was re-read from the output file and
+confirmed to exactly match the source log's degrees-converted values at multiple frames (start,
+middle, end). What's *not* confirmed: whether hitting Play in Composer actually drives the joints
+the way this assumes — that needs you to open the file in Composer and try it, since this assistant
+can't interact with Composer's GUI.
+
 ### Two real bugs found by automated smoke testing, both fixed
 
 Since this assistant can't press and hold a physical key, verification leaned on running
@@ -475,10 +548,21 @@ two genuine bugs before a human ever touched the script:
    `KEY_RELEASE` *before* touching `event.input.name`, mirroring the base `KeyboardControl` class's
    own (already-safe) pattern. Re-tested after the fix: zero tracebacks over a multi-minute run.
 
-**What's still unverified**: whether the arm actually visually moves in the viewport when a jog key
-is held. That requires a real window with keyboard focus and a human pressing keys — nothing an
-automated terminal session can produce. Both bugs found by smoke testing are fixed; this last check
-is the one thing left for you to confirm.
+**Confirmed working, by a human**: after these fixes, `keyboard_agent.py` was run for real — clicked
+into the viewport, held a jog key, and **the arm moved**. One real wrinkle hit along the way, worth
+recording since it'll recur: total boot time (extension loading through `env.reset()`) ran to roughly
+**2-3 minutes** on this machine, and Windows marked the window "Not Responding" for that whole
+stretch — Kit-based apps don't pump the Windows message loop during heavy synchronous
+extension/shader loading, so the OS shows this even though the process is actively working, not
+hung. Reading the console log confirmed it had reached the last startup print
+(`Found Camera: external_D455`, immediately before the interactive loop begins) well before the
+window was checked — i.e. it wasn't actually stuck, just slow and not repainting. If you hit this:
+wait it out (don't kill the process) and try clicking into the window and pressing a key once the
+console log goes quiet; that's steady state, not a hang (same phenomenon as the "apparent hangs" note
+in §5a, just showing up at the OS window level instead of the console).
+
+**Task 1 is now fully done**: sim confirmed (§5a), teleop script written and bug-fixed, and the arm
+visually confirmed moving under keyboard jog control.
 
 ## 8. Getting started today (tasks 2 and most of task 3)
 

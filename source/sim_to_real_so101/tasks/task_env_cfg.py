@@ -70,6 +70,13 @@ camera_object = TiledCameraCfg(
 
 @configclass
 class SO101TaskSceneCfg(LerobotSo101BaseSceneCfg):
+    room = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Room",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{assets_path}/usd/indoor-room.usd",
+        ),
+    )
+
     lightstudio = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/LightStudio",
         spawn=sim_utils.UsdFileCfg(
