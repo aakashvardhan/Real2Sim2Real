@@ -24,8 +24,6 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sensors import ContactSensor
 from isaaclab.managers import SceneEntityCfg
 
-from ._compat import as_torch
-
 
 
 def any_vial_grasped(
@@ -79,7 +77,7 @@ def any_vial_grasped(
     contact_sensor: ContactSensor = env.scene[contact_sensor_cfg.name]
     
     # Get contact forces - shape: (num_envs, num_bodies, num_filters, 3)
-    contact_forces = as_torch(contact_sensor.data.force_matrix_w)
+    contact_forces = contact_sensor.data.force_matrix_w
     
     # Calculate force magnitude per filter (each filter corresponds to a vial)
     # Shape: (num_envs, num_bodies, num_filters)
@@ -95,7 +93,7 @@ def any_vial_grasped(
     
     for vial_idx, vial_name in enumerate(vials):
         vial: RigidObject = env.scene[vial_name]
-        vial_z = as_torch(vial.data.root_pos_w)[:, 2]  # Z position per environment
+        vial_z = vial.data.root_pos_w[:, 2]  # Z position per environment
         
         has_contact_with_vial = contact_per_filter[:, vial_idx] > force_threshold
         vial_is_lifted = vial_z > min_height
@@ -214,14 +212,14 @@ def vial_placed_on_rack(
 
     # Get contact sensor for grasp detection
     contact_sensor: ContactSensor = env.scene[contact_sensor_cfg.name]
-    contact_forces = as_torch(contact_sensor.data.force_matrix_w)
+    contact_forces = contact_sensor.data.force_matrix_w
     contact_force_norm = torch.linalg.vector_norm(contact_forces, dim=-1)
     contact_per_filter = contact_force_norm.sum(dim=1)  # (num_envs, num_filters)
 
     # Get rack pose in world frame
     rack_obj: RigidObject = env.scene[rack_name]
-    rack_pos_w = as_torch(rack_obj.data.root_pos_w)       # (num_envs, 3)
-    rack_quat_w = as_torch(rack_obj.data.root_quat_w)     # (num_envs, 4)
+    rack_pos_w = rack_obj.data.root_pos_w       # (num_envs, 3)
+    rack_quat_w = rack_obj.data.root_quat_w     # (num_envs, 4)
     rack_quat_inv = math_utils.quat_inv(rack_quat_w)
 
     any_vial_newly_placed = torch.zeros(num_envs, dtype=torch.bool, device=device)
@@ -232,8 +230,8 @@ def vial_placed_on_rack(
 
     for vial_idx, vial_name in enumerate(vials):
         vial: RigidObject = env.scene[vial_name]
-        vial_pos_w = as_torch(vial.data.root_pos_w)       # (num_envs, 3)
-        vial_quat_w = as_torch(vial.data.root_quat_w)     # (num_envs, 4)
+        vial_pos_w = vial.data.root_pos_w       # (num_envs, 3)
+        vial_quat_w = vial.data.root_quat_w     # (num_envs, 4)
 
         # --- Grasp detection ---
         vial_grasped_now = contact_per_filter[:, vial_idx] > force_threshold
@@ -353,13 +351,13 @@ def vial_placed_on_rack_termination(
     still_valid = torch.zeros(num_envs, dtype=torch.bool, device=device)
     if env._rack_confirm_active.any():
         contact_sensor: ContactSensor = env.scene[contact_sensor_cfg.name]
-        contact_forces = as_torch(contact_sensor.data.force_matrix_w)
+        contact_forces = contact_sensor.data.force_matrix_w
         contact_force_norm = torch.linalg.vector_norm(contact_forces, dim=-1)
         contact_per_filter = contact_force_norm.sum(dim=1)
 
         rack_obj: RigidObject = env.scene[rack_name]
-        rack_pos_w = as_torch(rack_obj.data.root_pos_w)
-        rack_quat_w = as_torch(rack_obj.data.root_quat_w)
+        rack_pos_w = rack_obj.data.root_pos_w
+        rack_quat_w = rack_obj.data.root_quat_w
         rack_quat_inv = math_utils.quat_inv(rack_quat_w)
 
         unit_z = torch.zeros(num_envs, 3, device=device)
@@ -373,8 +371,8 @@ def vial_placed_on_rack_termination(
                 continue
 
             vial_obj: RigidObject = env.scene[vial_name]
-            vial_pos_w = as_torch(vial_obj.data.root_pos_w)
-            vial_quat_w = as_torch(vial_obj.data.root_quat_w)
+            vial_pos_w = vial_obj.data.root_pos_w
+            vial_quat_w = vial_obj.data.root_quat_w
 
             vial_grasped_now = contact_per_filter[:, vial_idx] > force_threshold
             vial_up_world = math_utils.quat_apply(vial_quat_w, unit_z)

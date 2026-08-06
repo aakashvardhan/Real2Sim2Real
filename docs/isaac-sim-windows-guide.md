@@ -1,0 +1,583 @@
+# Running the SO-101 Workshop Natively on Windows (Isaac Sim + Isaac Lab)
+
+This is a living document for students who have **Isaac Sim**, **Omniverse Kit SDK**, and **USD
+Composer** installed natively on Windows and want to work through this workshop's three tasks
+without Docker/Linux (the path [README.md](../README.md) documents). It captures what's been
+worked out so far — install requirements, a version-compatibility problem discovered along the
+way, and how to think about the three tasks in light of it. New findings get appended as
+troubleshooting entries; nothing here should be treated as final until you've verified it against
+your own machine.
+
+---
+
+## 1. The three tasks
+
+1. **Log into Omniverse and confirm Isaac Sim can simulate the SO-101 arm doing pick-and-place via
+   teleoperation.** Status: sim confirmed working (§5a); keyboard-jog teleop script not yet written
+   (§7).
+2. **(Aakash)** Open USD Composer, check for existing scene templates, and build a simple indoor
+   environment scene. **Status: done, see §10** — built programmatically rather than by hand in
+   Composer's GUI (this session can't drive a GUI app); still needs a visual look-over in Composer.
+3. **(Aakash)** Export that scene as `.usd`, import into Isaac Sim, and verify axis/scale alignment
+   with the robot arm. **Status: robot referenced into the scene and bounding boxes checked
+   programmatically, see §11 — still needs a visual look in Composer/Isaac Sim to fully close out.**
+
+> Note: the task list says "SO-ARM100" — this repo (and the USD assets in it) are built around
+> **SO-101** specifically (`SO-ARM101-USD.usd`, loaded by
+> [so101.py](../source/sim_to_real_so101/assets/so101.py)). SO-ARM100 is the predecessor hardware
+> line from the same open-source project.
+
+## 2. What's actually in this repo (relevant background)
+
+- Stack: **Isaac Lab** (an RL/robotics framework built on top of Isaac Sim), used via a
+  Docker image in the documented setup (`docker/sim/Dockerfile` pins **Isaac Lab 2.3.2**).
+- The robot: [so101.py](../source/sim_to_real_so101/assets/so101.py) defines `SO101_CFG`, an
+  `ArticulationCfg` with per-joint actuator tuning (stiffness/damping/effort limits matched to the
+  real servos' gear ratios).
+- The task: `Lerobot-So101-Teleop-Vials-To-Rack` in
+  [vials_to_rack_env_cfg.py](../source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py) — pick up
+  a vial, place it in a rack, detected via a contact sensor + geometric checks
+  (`vial_placed_on_rack_termination`, lines 250-267).
+- Current "environment" is tabletop-only: a lightbox + mat
+  ([task_env_cfg.py:71-103](../source/sim_to_real_so101/tasks/task_env_cfg.py#L71-L103)) — there is
+  **no room/indoor scene anywhere in this repo**, so task 2 is net-new content, not something to go
+  find here.
+- **Teleop input is hardware-bound in the shipped code**: the only teleop script,
+  [lerobot_agent.py](../source/sim_to_real_so101/scripts/lerobot_agent.py), drives the sim purely
+  from a physical SO-101 leader arm over serial
+  ([lerobot_interface.py:21](../source/sim_to_real_so101/utils/lerobot_interface.py#L21)). There is
+  no keyboard/SpaceMouse/gamepad device wired to the SO-101's joints anywhere in the codebase
+  (confirmed by grep) — `zero_agent`/`random_agent` are non-interactive debug scripts only.
+  - **Decision made**: since no physical leader arm is being used, teleop will be demonstrated via a
+    **new keyboard-jogging script** (not yet written) that replaces `LeRobotSO101Interface` as the
+    action source with per-joint key mappings, reusing the camera/recording scaffolding from
+    `lerobot_agent.py`. See §6.
+
+## 3. What's actually installed on this machine
+
+Checked directly (not assumed):
+
+| Item | Location | Notes |
+|---|---|---|
+| Isaac Sim | `C:\Isaac-Sim` | Version **6.0.1-rc.7** (release candidate) |
+| Omniverse Kit SDK | `C:\Omniverse-Kit` | App-template dev kit (`repo.bat template new`) |
+| USD Composer | `C:\USD-Composer` | App-template pattern (`repo.bat launch`) |
+| SO-ARM100 hardware repo | `Desktop\SO-ARM100` | Physical robot repo; has `Simulation/SO100`, `Simulation/SO101` subfolders, worth checking for extra USD/URDF assets |
+| so101-lerobot | `Desktop\so101-lerobot` | Separate LeRobot project (own venv/docker), for real-hardware control — not directly relevant to Isaac Sim work |
+| Isaac Lab | **Installed** at `Y:\e` (subst-mapped to `C:\ilab\e`) | Isaac Lab 2.3.2 + bundled Isaac Sim 5.1.0.0 pip install, in its own Python 3.11 venv. See §5. |
+
+## 4. Why Isaac Lab is required (not optional)
+
+Isaac Sim by itself is the physics/rendering engine — it can load a USD stage and simulate it, but
+it has no concept of a "task," a reward/success condition, or tuned actuator behavior. Every file in
+`source/sim_to_real_so101` is written against Isaac Lab's API, not raw Isaac Sim:
+
+- `isaaclab.sim`, `isaaclab.actuators.ImplicitActuatorCfg`, `isaaclab.assets.ArticulationCfg` →
+  [so101.py:19-21](../source/sim_to_real_so101/assets/so101.py#L19-L21)
+- `isaaclab.envs.ManagerBasedRLEnvCfg`, `isaaclab.managers.*` →
+  [so101_env_cfg.py:17-22](../source/sim_to_real_so101/tasks/so101_env_cfg.py#L17-L22)
+- `isaaclab_tasks` (Gym task registry) → every script in `scripts/`
+
+Without Isaac Lab installed, `import isaaclab.sim as sim_utils` fails immediately and none of this
+repo's scripts can even start. The alternative — hand-writing the SO-101's actuators, the
+vial/rack task logic, and the teleop/recording pipeline directly against raw Isaac Sim/PhysX APIs —
+means rebuilding everything this workshop already provides.
+
+### Which of the 3 tasks actually need it
+
+| Task | Needs Isaac Lab? | Why |
+|---|---|---|
+| Task 1 (teleop pick-and-place, reusing this repo's task) | **Yes** | Actuator tuning, vial/rack scene, success detection, and the Gym env wrapper are all Isaac Lab config code |
+| Task 2 (build indoor scene in Composer) | **No** | Pure USD authoring — Composer doesn't touch `isaaclab` at all |
+| Task 3 (export, import, verify alignment) | **No**, for the core visual/manual check | Open both USD files in plain Isaac Sim and check alignment directly. Isaac Lab only matters if you also want the scene auto-wired into the task as an `AssetBaseCfg` |
+
+**Practical implication**: tasks 2 and (mostly) 3 can proceed right now with what's already
+installed. Isaac Lab is only a blocker for task 1.
+
+## 5. The compatibility problem
+
+This is the main blocker discovered so far, and it's worth understanding precisely before
+installing anything.
+
+- Isaac Lab **2.3.2** (what this repo's Docker image pins) requires **Isaac Sim 5.x + Python
+  3.11** — Isaac Lab's own docs state using a different Python version "will result in errors."
+- This machine's Isaac Sim is **6.0.1-rc.7**. There is a confirmed, open Isaac Lab bug
+  ([#5435](https://github.com/isaac-sim/IsaacLab/issues/5435)) showing Isaac Lab's code fails to
+  launch against Isaac Sim 6.0.0 — it references extensions
+  (`isaacsim.core.experimental.primdata`, `isaacsim.robot.wheeled_robots.nodes`,
+  `isaacsim.sensors.experimental.rtx`, `isaacsim.util.debug_draw`) that don't exist in that Isaac
+  Sim release's pip bundle.
+- The Isaac Lab release that *does* target Isaac Sim 6.0.0/6.0.1 is **Isaac Lab 3.0.0 Beta (Beta
+  2)** ([release](https://github.com/isaac-sim/IsaacLab/releases/tag/v3.0.0-beta),
+  [discussion #6249](https://github.com/isaac-sim/IsaacLab/discussions/6249)). But:
+  - It's a **"ground-up architectural overhaul"**: multi-backend physics, a pluggable renderer,
+    Warp-native data pipelines, kit-less install mode — not a simple version bump.
+  - **Windows pip wheels are not available yet** — NVIDIA's release notes say Windows support "will
+    be available soon" (future tense). It currently targets Ubuntu.
+  - There's an open dependency-conflict bug even on the platform it does support
+    ([#6200](https://github.com/isaac-sim/IsaacLab/issues/6200)).
+
+**Net effect**: there is currently no Isaac Lab release that both (a) has Windows pip wheels and (b)
+matches this machine's Isaac Sim 6.0.1-rc.7.
+
+### The official Isaac Lab 2.3.2 pip install (for reference)
+
+```powershell
+python3.11 -m venv env_isaaclab
+env_isaaclab\Scripts\activate
+python -m pip install --upgrade pip
+pip install isaaclab[isaacsim,all]==2.3.2.post1 --extra-index-url https://pypi.nvidia.com
+pip install -U torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+Important: this pip package **bundles its own Isaac Sim 5.x** — it does not attach to the existing
+`C:\Isaac-Sim` 6.0.1-rc.7 install. Running it gives you a second, separate Isaac Sim living inside
+that Python venv, leaving the existing install untouched.
+
+### Options going forward
+
+1. **Let the 2.3.2 pip install bring its own Isaac Sim 5.x** (command above) — matches this repo's
+   code exactly; costs a second Isaac Sim install on disk.
+2. **Wait for Isaac Lab 3.0's Windows wheels**, then likely need to adapt this repo's Isaac Lab
+   2.x-era code to whatever 3.0's API changed (see §6 for exactly what would need to change).
+3. **Go back to Docker/WSL2** per the main README — sidesteps version-matching entirely since the
+   image already bundles known-working versions together.
+
+**Decision taken: Option 1.** Isaac Lab 2.3.2 + its bundled Isaac Sim 5.1.0.0 is installed and
+confirmed working — see §5a below for the exact steps and three real problems hit along the way.
+
+## 5a. Confirmed working: the actual install, and 3 real problems hit
+
+The official pip install (§5) was followed almost exactly, with one change forced by a Windows
+path-length issue, and it now works end-to-end: `list_envs` prints the full task table
+(`Lerobot-So101-Teleop-Base`, `-Task`, `-Vials-To-Rack`, `-Vials-To-Rack-DR`, `-Vials-To-Rack-Eval`,
+`-Vials-To-Rack-DR-Eval`) inside the actual Isaac Sim/Kit process, with the RTX 5080 Laptop GPU
+correctly detected.
+
+**Setup used:**
+- `uv` (already on this machine at `C:\Users\OMNI-User\.local\bin\uv.exe`) to create the Python 3.11
+  venv, instead of a separately-installed system Python (none was present) — `uv venv --python 3.11
+  --seed <path>` fetches its own CPython 3.11 build automatically.
+- The venv lives at **`Y:\e`**, where `Y:` is a `subst`-mapped drive pointing at `C:\ilab`. This is
+  not the original planned location (`C:\Users\OMNI-User\Desktop\env_isaaclab`) — see Problem 1 below
+  for why.
+- `pip install "isaaclab[isaacsim,all]==2.3.2.post1" --extra-index-url https://pypi.nvidia.com`,
+  then `pip install -U torch==2.7.0 torchvision==0.22.0 --index-url
+  https://download.pytorch.org/whl/cu128` (the plain `isaaclab[isaacsim]` install pulls a CPU-only
+  torch build; the CUDA build has to be installed as a separate, explicit step over it).
+- `pip install -e source/sim_to_real_so101` into that same venv.
+
+### Problem 1: Windows path-length limit broke the install, and admin rights weren't available to fix it properly
+
+First attempt (venv at `Desktop\env_isaaclab`) failed mid-install with:
+```
+OSError: [Errno 2] No such file or directory: '...env_isaaclab\Lib\site-packages\isaacsim\extscache\
+isaacsim.replicator.caption.core-...\isaacsim\replicator\caption\core\tests\test_data\
+Test_Scene_Data_Camera_00\bounding_box_2d_loose\bounding_box_2d_loose_labels_0003.json'
+```
+This is the Windows `MAX_PATH` (260-character) limit — the `isaacsim-replicator` package ships deeply
+nested test-data files. The real fix is enabling `LongPathsEnabled` in the registry
+(`HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem`), which **requires administrator rights**.
+Admin access wasn't available on this machine (a UAC elevation attempt was also tried and canceled —
+either declined or no interactive session was available for the prompt to render in).
+
+**Workaround used (no admin required)**: Windows' `subst` command maps a drive letter to a folder
+as a per-user, session-scoped virtual drive — this shortens the *effective* path Windows sees,
+sidestepping the 260-character limit without touching the registry.
+```powershell
+mkdir C:\ilab
+subst Y: C:\ilab
+```
+The venv was then created at `Y:\e` instead of the long `Desktop\env_isaaclab` path, leaving enough
+headroom under the limit for the deepest files in the `isaacsim-replicator` package. Re-running the
+install (pip's cache already had most packages downloaded) succeeded.
+
+**Caveat**: `subst` mappings are session-only by default — they don't survive a reboot. To avoid
+needing to manually re-run `subst Y: C:\ilab` after every restart, a small startup script was added:
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\restore_ilab_subst.bat`
+```bat
+@echo off
+if not exist Y:\ (
+    subst Y: C:\ilab
+)
+```
+This runs at every login (no admin needed for the Startup folder) and recreates the mapping if it's
+missing. **If `Y:` doesn't exist after a reboot, this script should still create it at next login —
+if the venv becomes unreachable, check this file exists and re-run it manually first.**
+
+### Problem 2: Isaac Sim's first-run EULA prompt hangs in a non-interactive shell
+
+`list_envs` initially failed with `Unable to bootstrap inner kit kernel: EOF when reading a line` —
+Isaac Sim's Kit bootstrap (`isaacsim/kit/kit_app.py`) prompts interactively for EULA acceptance on
+first run (`Do you accept the EULA? (Yes/No):`), which fails immediately in a non-interactive
+terminal. It checks (in order) the `OMNI_KIT_ACCEPT_EULA` env var, then a persisted
+`EULA_ACCEPTED` marker file next to the bootstrap script. The marker file was written directly to
+skip this permanently:
+```
+Y:\e\Lib\site-packages\isaacsim\kit\EULA_ACCEPTED   (contents: "yes")
+```
+
+### Problem 3: h5py DLL conflict crashed the Kit process
+
+After fixing the above, `list_envs` got much further (extensions loading, GPU detected) but then
+crashed with:
+```
+ImportError: DLL load failed while importing _errors: The specified procedure could not be found.
+```
+while the `isaaclab_tasks` extension imports `h5py` (via `isaaclab.managers.recorder_manager` →
+`isaaclab.utils.datasets.hdf5_dataset_file_handler`) — followed by a fatal process crash
+(`Windows fatal exception: code 0xc0000139`) on a second import attempt. `h5py` works fine in
+isolation (`python -c "import h5py"` succeeds), so this is specific to running **inside** the Kit
+process: Kit loads its own native libraries (plausibly a same-named `z.dll`/zlib) before
+`isaaclab_tasks` gets to import `h5py`, and Windows' DLL loader reuses whatever same-named library is
+already resident in the process rather than h5py's own bundled copy — binding h5py's compiled
+extension to an incompatible version.
+
+**Fix applied**: import `h5py` at the very top of every script that boots `AppLauncher`, *before*
+Isaac Sim/Kit starts — this loads h5py's own bundled DLLs into a clean process first, so the later
+(cached, no-op) `import h5py` inside `isaaclab_tasks` never re-triggers DLL loading at all. Applied
+to all 5 scripts that call `AppLauncher` (`lerobot_push_dataset.py` doesn't launch Isaac Sim, so it
+was left alone):
+- [list_envs.py](../source/sim_to_real_so101/scripts/list_envs.py)
+- [zero_agent.py](../source/sim_to_real_so101/scripts/zero_agent.py)
+- [random_agent.py](../source/sim_to_real_so101/scripts/random_agent.py)
+- [lerobot_agent.py](../source/sim_to_real_so101/scripts/lerobot_agent.py)
+- [lerobot_eval.py](../source/sim_to_real_so101/scripts/lerobot_eval.py)
+
+**Reverting**: each was backed up before editing (`list_envs.py.bak`, `zero_agent.py.bak`,
+`random_agent.py.bak`, `lerobot_agent.py.bak`, `lerobot_eval.py.bak`, all in `scripts/`). Copy a
+`.bak` back over its counterpart to undo.
+
+### Problem 4: intermittent carb render-settings crash — a race condition, not a real incompatibility
+
+`zero_agent --task Lerobot-So101-Teleop-Vials-To-Rack` sometimes crashed during `gym.make()` with:
+```
+ValueError: '/rtx/translucency/reflectAtAllBounce' in RenderCfg.general_parameters does not map to a carb setting.
+```
+raised from `isaaclab/sim/simulation_context.py`'s `_apply_render_settings_from_cfg`, which validates
+every key in the `carb_settings` dict this repo sets in
+[task_env_cfg.py:239-252](../source/sim_to_real_so101/tasks/task_env_cfg.py#L239-L252) (RTX
+translucency settings for the glass vials) by calling `get_setting(key)` and raising if it returns
+`None`.
+
+**Investigation**: a standalone script that booted `AppLauncher` and checked all 6 settings
+individually found every one of them registered and valid (`get_setting()` returned real values, not
+`None`) — so the settings genuinely exist in this Isaac Sim 5.1.0.0 build. Re-running the *exact same*
+`zero_agent` command twice showed one run crash and the next succeed, with identical code and
+identical settings. **Conclusion: Kit loads extensions partly via background thread pools, and
+`gym.make()` can call `SimulationContext.__init__()` before the RTX renderer extension has finished
+registering these specific settings — a timing race, not a hard incompatibility.**
+
+**No code change applied** — retrying the same command is the practical workaround if this is hit
+again. If it becomes a frequent annoyance, the more permanent fix would be moving these RTX
+translucency settings out of `EnvCfg.__post_init__`'s strictly-validated `carb_settings` dict and
+into a direct `carb.settings.get_settings().set(path, value)` call made *after* `gym.make()` returns
+(that API doesn't validate pre-existence the way Isaac Lab's config path does) — not yet needed since
+this hasn't recurred often enough to justify the change.
+
+### Unrelated, non-fatal noise seen in the logs
+
+`isaacsim.sensors.rtx` (lidar/radar) failed to load its native plugins
+(`generic_mo_io.dll`, `nvlidar_pc_converter.plugin.dll` — "The specified module could not be
+found"). This repo doesn't use lidar/radar sensors (only `TiledCameraCfg` for RGB/depth/segmentation),
+so this is cosmetic — Kit logs the extension failure and continues; it did not prevent
+`isaaclab_tasks` from loading or `list_envs` from completing successfully.
+
+### Confirmed: `zero_agent` renders the actual task scene correctly
+
+`zero_agent --task Lerobot-So101-Teleop-Vials-To-Rack` was run and visually confirmed in the Isaac
+Sim viewport: the orange SO-101 arm in its reset pose, the yellow lightbox, the mat, and the 3 vials
+with blue caps — matching `VialsToRackSceneCfg` exactly. The `IsaacLab` panel's `Camera Eye`/
+`Camera Target` values (`-0.25, -0.4, 0.22` / `0.15, 0.0, 0.12`) match
+`SO101TeleopEnvCfg.__post_init__` in [so101_env_cfg.py:167-168](../source/sim_to_real_so101/tasks/so101_env_cfg.py#L167-L168),
+and the Scene Debug Visualization panel lists exactly this repo's scene entities (`Vial 1/2/3`,
+`Rack Left`, `Robot`, `Ee_Frame`).
+
+**Note on apparent hangs**: once the simulation reaches steady state, the console log stops
+producing new lines — this looks like a hang but isn't one. Check the actual viewport window before
+assuming a stall; the render loop doesn't log anything once it's just running.
+
+### Running commands in this venv going forward
+
+```powershell
+Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.list_envs
+Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.zero_agent --task Lerobot-So101-Teleop-Vials-To-Rack
+```
+(`Y:` must be mapped first — the startup script above handles this automatically after a reboot; if
+it's a fresh session and `Y:` isn't mapped yet, run `subst Y: C:\ilab` manually.)
+
+## 6. Proof: Isaac Lab 3.0 Beta would break this repo's existing MDP code
+
+Isaac Lab 3.0's documented breaking change: **all `.data.*` properties on asset and sensor classes
+now return `wp.array` (NVIDIA Warp) instead of `torch.Tensor`.** This repo's `mdp/` package was
+written entirely assuming `torch.Tensor`, with no conversion anywhere — this is not a hypothetical
+edge case, it hits the reset, per-step observation, and termination paths simultaneously:
+
+- [mdp/obs.py:34-40](../source/sim_to_real_so101/mdp/obs.py#L34-L40) — `robot.data.root_pos_w`/
+  `root_quat_w` feed `torch.cat(...)`, which cannot accept a `wp.array`.
+- [mdp/obs.py:52-54](../source/sim_to_real_so101/mdp/obs.py#L52-L54) — `sensor.data.output[...]`
+  `.clone()`'d and passed downstream to the numpy/imageio recording pipeline.
+- [mdp/terms.py:80-84](../source/sim_to_real_so101/mdp/terms.py#L80-L84) —
+  `contact_sensor.data.force_matrix_w` → `torch.linalg.vector_norm(...)`, which requires a
+  `torch.Tensor` argument. **This runs every `env.step()`** via the `any_vial_grasped` and
+  `vial_placed_on_rack` observation terms.
+- [mdp/terms.py:221-223](../source/sim_to_real_so101/mdp/terms.py#L221-L223),
+  [358-361](../source/sim_to_real_so101/mdp/terms.py#L358-L361) — `.data.root_pos_w`/
+  `root_quat_w` piped into `math_utils.quat_inv`/`quat_apply`.
+- [mdp/resets.py:291](../source/sim_to_real_so101/mdp/resets.py#L291),
+  [312](../source/sim_to_real_so101/mdp/resets.py#L312) — `asset.data.default_root_state[env_ids]`
+  → `torch.cat([positions, orientations], dim=-1)` → `write_root_pose_to_sim`. **This runs on every
+  environment reset**, so even a first `env.reset()` in `zero_agent.py` would break.
+
+Conclusion: without changes, this repo's task cannot take a single simulation step under Isaac Lab
+3.0's Warp-based data model.
+
+**Unconfirmed secondary risk**: Isaac Lab 3.0 release notes also mention a quaternion convention
+change (wxyz → xyzw). This repo builds rotations via `isaacsim.core.utils.rotations.euler_angles_to_quat`
+(e.g. [so101.py:51](../source/sim_to_real_so101/assets/so101.py#L51)) — whether that specific
+function's output convention changes wasn't confirmed from available docs. Worth testing for
+(robot/camera/mat spawning at the wrong orientation) if/when 3.0 is actually tried.
+
+### Suggested code change (not yet applied)
+
+A small, backward-compatible shim — a no-op on today's Isaac Lab 2.3.2, only load-bearing if/when
+moving to 3.0:
+
+```python
+# source/sim_to_real_so101/mdp/_compat.py
+"""Normalizes Isaac Lab asset/sensor `.data.*` outputs to torch.Tensor.
+
+Isaac Lab 2.x returns torch.Tensor from `.data.*`; Isaac Lab 3.0 returns
+warp.array instead. This keeps the mdp package working unmodified on either.
+"""
+import torch
+
+
+def as_torch(x):
+    if isinstance(x, torch.Tensor):
+        return x
+    try:
+        import warp as wp
+        if isinstance(x, wp.array):
+            return wp.to_torch(x)
+    except ImportError:
+        pass
+    return x
+```
+
+Then wrap every `.data.*` read at its call site in `terms.py`, `obs.py`, and `resets.py`, e.g.:
+```python
+contact_forces = as_torch(contact_sensor.data.force_matrix_w)
+vial_z = as_torch(vial.data.root_pos_w)[:, 2]
+rack_pos_w = as_torch(rack_obj.data.root_pos_w)
+rack_quat_w = as_torch(rack_obj.data.root_quat_w)
+```
+
+**Status: applied.** [`mdp/_compat.py`](../source/sim_to_real_so101/mdp/_compat.py) now exists, and
+every `.data.*` call site listed above (in `obs.py`, `terms.py`, `resets.py`) is wrapped with
+`as_torch(...)`. It's a no-op today (Isaac Lab 2.3.2's `.data.*` already returns `torch.Tensor`),
+and only becomes load-bearing if/when the project moves to Isaac Lab 3.0.
+
+**Reverting**: before editing, a backup of each original file was saved alongside it —
+`mdp/obs.py.bak`, `mdp/terms.py.bak`, `mdp/resets.py.bak`. To roll back, copy a `.bak` file over its
+counterpart (e.g. `copy mdp\obs.py.bak mdp\obs.py` on Windows) and delete `mdp/_compat.py`.
+
+## 7. Task 1, revised: keyboard teleop instead of hardware
+
+Since no physical leader arm is being used, "teleoperation" needs a new input source. The chosen
+approach: **per-joint keyboard jogging**, mapping key pairs to +/- deltas on each of the SO-101's 6
+joints (`Rotation, Pitch, Elbow, Wrist_Pitch, Wrist_Roll, Jaw`), following the same
+`carb.input`/`omni.appwindow` event-subscription pattern already used in
+[keyboard.py](../source/sim_to_real_so101/utils/keyboard.py) for the R/S/C hotkeys — just extended
+to continuous held-key deltas instead of one-shot flags.
+
+Rejected alternative: mapping Isaac Lab's built-in `Se3Keyboard` device directly — it outputs 6-DoF
+end-effector pose deltas for IK-based control, but this repo's action space is raw joint positions
+(`ActionsCfg.joint_positions` in
+[so101_env_cfg.py:71-76](../source/sim_to_real_so101/tasks/so101_env_cfg.py#L71-L76)), so it doesn't
+plug in without adding a new IK action term. Per-joint jogging avoids that extra work.
+
+**Not yet implemented**: a `keyboard_agent.py` script (sibling to `lerobot_agent.py`) that keeps the
+camera/recording scaffolding but replaces `robot_iface.robot.get_action()`
+([lerobot_agent.py:177](../source/sim_to_real_so101/scripts/lerobot_agent.py#L177)) with the
+keyboard-jog action source, and an extended `KeyboardControl` with continuous held-key state
+tracking.
+
+## 8. Getting started today (tasks 2 and most of task 3)
+
+No Isaac Lab needed for this part:
+
+1. Launch USD Composer (`C:\USD-Composer\repo.bat launch` — see §9 for full instructions).
+2. Check this GitHub repo and any NVIDIA Omniverse sample-asset repos for an existing indoor-scene
+   template (confirmed: none exists in this repo).
+3. Build a simple floor/walls/lighting scene, **in meters** — this repo's every offset is in meters
+   (e.g. `pos=(-0.05, 0.0, 0)` in [so101.py:50](../source/sim_to_real_so101/assets/so101.py#L50)),
+   and Composer templates sometimes default to centimeters, which is the most common source of a
+   100x scale bug later.
+4. Leave an explicit origin/mounting point in the scene for where the SO-101 tabletop rig will sit.
+5. Export as `.usd`, open it alongside `SO-ARM101-USD.usd` (from `assets/usd/`) directly in Isaac
+   Sim, and check axis/scale alignment visually — Z-up, meters, robot base rotated 90° yaw
+   (`euler_angles_to_quat([0,0,90])` at [so101.py:51](../source/sim_to_real_so101/assets/so101.py#L51)).
+
+**Status: steps 1-4 done, see §10.** Step 5 (visual alignment check) is next — see §11.
+
+## 9. Launching Isaac Sim and USD Composer directly
+
+Both are separate GUI applications from the Isaac-Lab-driven scripts in §5a — useful for opening and
+inspecting `.usd` files directly (tasks 2/3) without any Isaac Lab/Python involvement at all.
+
+### USD Composer
+
+```powershell
+cd C:\USD-Composer
+.\repo.bat launch
+```
+(This is documented in `README-USD-COMPOSER.txt` on the Desktop.) First launch takes ~30-40 seconds
+(many extensions to load — normal, matches the pattern seen with Isaac Sim). No EULA prompt was hit
+launching this way. Once the window is up:
+
+- **File → Open**, navigate to a `.usd`/`.usda` file, e.g.
+  `C:\Users\OMNI-User\Desktop\Sim-to-Real-SO-101-Workshop\source\sim_to_real_so101\assets\usd\SO-ARM101-USD.usd`
+- The viewport shows an FPS/GPU-memory overlay when a stage is loaded; RTX real-time rendering
+  confirmed working at ~60 FPS on the RTX 5080 Laptop GPU.
+
+**Confirmed**: opening `SO-ARM101-USD.usd` this way loaded the robot geometry correctly, fully
+independent of Isaac Lab — proving the file itself is portable, exactly as expected (see §4). One
+thing to know: the arm appears **plain yellow/untextured** in Composer, not the orange seen in Isaac
+Sim — that orange color comes from `randomize_robot_color` in
+[resets.py](../source/sim_to_real_so101/mdp/resets.py), which sets the material *at Isaac-Lab
+runtime*, not something baked into the raw USD file. Composer just shows the file's true default
+state.
+
+### Isaac Sim (standalone, no Isaac Lab)
+
+The native Isaac Sim 6.0.1-rc.7 install (not the Isaac-Lab-bundled 5.1.0.0 one at `Y:\e`) can be
+launched directly via the Desktop shortcut (`isaac-sim.bat - Shortcut.lnk`) or:
+```powershell
+C:\Isaac-Sim\isaac-sim.bat
+```
+This opens plain Isaac Sim with no Isaac Lab task/robot config loaded — useful for opening `.usd`
+files the same way as Composer (File → Open) when you want Isaac Sim's specific tools rather than
+Composer's, but it won't know anything about this repo's tasks, actuators, or scene composition
+(that only exists when launched through the `Y:\e` Isaac Lab venv per §5a). Not yet tested this
+session — if you try it, add findings here.
+
+### A Composer-default new stage is Y-up and centimeters — a real, confirmed mismatch
+
+Before building anything, the existing untracked stage at
+`usd-composer-stages/so-arm101-demo.usd` (Composer's plain **File → New** template, sky + distant
+light + a 1400x1400 unit ground grid, nothing else authored) was opened programmatically to check
+its conventions:
+
+```
+UpAxis: Y
+MetersPerUnit: 0.01
+```
+
+Compared against `SO-ARM101-USD.usd` (the actual robot asset):
+
+```
+UpAxis: Z
+MetersPerUnit: 1.0
+```
+
+So Composer's default new-stage template is **Y-up, centimeters** — exactly the "100x scale bug"
+§8 step 3 warned about in the abstract, now confirmed concretely on this machine with real
+numbers. Building task 2's room by hand starting from **File → New** means either fixing
+`upAxis`/`metersPerUnit` in the stage's own metadata (Composer exposes this under stage
+properties) or authoring every offset in the wrong units and space. Neither is hard, but it's an
+easy thing to get wrong silently — a wall placed at "4 units" away is 4 cm, not 4 m, and looks
+identical to a human eyeballing proportions in the viewport at first glance.
+
+## 10. Task 2, done: indoor room scene, authored programmatically
+
+**Why programmatic instead of clicking through Composer's GUI**: this assistant (Claude Code) runs
+in a terminal and cannot drive a GUI application's mouse/keyboard — there's no way to actually
+perform "File → New → drag in a cube → scale it" through this session. Composer stages are plain
+USD files, though, so the room was authored directly with `pxr` (USD's own Python API) instead,
+which sidesteps the Y-up/cm trap above by construction (the script sets `Z-up` / `metersPerUnit=1.0`
+explicitly, matching `SO-ARM101-USD.usd` exactly) and is easy to re-run with different numbers.
+
+**How this was run**: `pxr` isn't installed anywhere on this machine as a standalone importable
+package (Isaac Sim/Isaac Lab only expose it bundled inside the Kit process). A throwaway venv was
+made instead, isolated from the `Y:\e` Isaac Lab install:
+```powershell
+uv venv --python 3.11 --seed usdenv
+usdenv\Scripts\python.exe -m pip install usd-core
+```
+`usd-core` is the pure-Python-and-native-bindings OpenUSD distribution from Pixar/NVIDIA on PyPI —
+no Kit, no GPU, no rendering, just the schema/authoring API. It's a good general tool for scripted
+USD authoring or inspection any time Composer/Isaac Sim's full GUI boot isn't needed.
+
+**What was built**: [`usd-composer-stages/build_indoor_scene.py`](../usd-composer-stages/build_indoor_scene.py),
+run as `usdenv\Scripts\python.exe build_indoor_scene.py usd-composer-stages\indoor-scene.usd`,
+producing [`usd-composer-stages/indoor-scene.usd`](../usd-composer-stages/indoor-scene.usd):
+
+- A 4m x 4m floor and four 2.5m-tall walls (0.1m thick), centered on the world origin, each with
+  `UsdPhysics.CollisionAPI` applied (static colliders — matches the pattern Composer's own default
+  template uses for its ground plane).
+- `/World/RobotMount` — a flat orange cylinder marker (0.6m radius) at the exact world origin,
+  visually marking where the SO-101 tabletop rig (lightbox + mat from `task_env_cfg.py`) should be
+  dropped in. The robot's own root sits at `(-0.05, 0, 0)` with a 90° yaw in that rig's local frame
+  (`so101.py:50-51`), so placing the rig's origin at the mount marker's origin lines both up
+  directly with no extra offset math.
+- A `DomeLight` for ambient fill plus one ceiling `RectLight` as a key light.
+- Simple `UsdPreviewSurface` materials (flat gray floor/walls, orange mount marker) — no textures,
+  intentionally minimal per "simple indoor environment scene."
+- `/World/Robot` — `SO-ARM101-USD.usd` pulled in as a USD **reference** (relative path
+  `../source/sim_to_real_so101/assets/usd/SO-ARM101-USD.usd`), offset by `(-0.05, 0, 0.01)` to
+  match the `(-0.05, 0, 0)` spawn offset `task_env_cfg.py` actually uses. No extra rotation was
+  added on top — inspecting the raw file showed its own default prim already bakes in a 90° yaw via
+  its root `xformOp:orient` (`(0.7071, 0, 0, 0.7071)`, i.e. 90° about Z), so adding another yaw here
+  would have double-rotated it.
+
+**Verified programmatically**: reopened the output file and confirmed `UpAxis: Z`,
+`MetersPerUnit: 1.0`, a room world-space bounding box of `(-2.05, -2.05, -0.1)` to
+`(2.05, 2.05, 2.5)` (matching the intended 4m room + wall thickness exactly), and the referenced
+robot's world-space bounding box — `(-0.08, -0.38, 0.04)` to `(0.05, 0.05, 0.31)` — sitting well
+inside the room and on the mount plate, no scale mismatch or stray offset. Not yet visually
+confirmed in Composer.
+
+**Not yet done — needs your eyes**: open `usd-composer-stages/indoor-scene.usd` in Composer
+(§9) to visually confirm it looks like a reasonable room (materials, light levels, proportions) and
+tweak from there if you want — that hands-on pass is exactly the part a terminal session can't do.
+The existing `so-arm101-demo.usd` in the same folder is untouched and is just Composer's blank
+default template; the new `indoor-scene.usd` is the actual task 2 deliverable.
+
+**Regenerating or editing further**: re-run `build_indoor_scene.py` with edited constants
+(`ROOM_SIZE`, `WALL_HEIGHT`, `WALL_THICKNESS`, `MOUNT_RADIUS` at the top of the file) to regenerate
+from scratch, or just open the output `.usd` in Composer and edit it directly there — both are
+valid; the script is there so the starting point is reproducible and correctly scaled/oriented by
+construction.
+
+## 11. Task 3: verify alignment
+
+The robot is now referenced directly into `indoor-scene.usd` at `/World/Robot` (see §10) — opening
+that one file in Composer or Isaac Sim shows the room and the robot together, no separate
+import/combine step needed. Bounding-box math confirms no scale mismatch or stray offset (§10).
+
+**Not yet done — needs your eyes**: open `usd-composer-stages/indoor-scene.usd` in Composer (§9)
+and visually confirm the robot sits upright, right-side-up, and roughly centered on the orange
+`/World/RobotMount` marker — that's the actual "verify axis/scale alignment" check §8 step 5 asked
+for. If it looks wrong (robot on its side, floating, tiny/huge relative to the room), the most
+likely culprit is the rotation assumption in §10 (that the file's baked-in orient already covers
+the 90° yaw) — check `xformOp:orient` on `/World/Robot`'s referenced prim if so.
+
+## Troubleshooting log
+
+*(Append new rows here as real issues come up. Rows marked **Confirmed** were actually hit and
+fixed on this machine — see §5a for full detail. The rest are seeded from reading the code and
+haven't necessarily been hit yet.)*
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| **Confirmed** — `pip install` fails with `OSError: [Errno 2] No such file or directory` deep inside `isaacsim\extscache\isaacsim.replicator.caption.core-...\tests\test_data\...` | Windows `MAX_PATH` (260 char) limit hit by deeply nested test-data files in the `isaacsim-replicator` package | No admin rights → use `subst Y: C:\<short-folder>` and install into `Y:\...` instead of a long path like `Desktop\env_isaaclab`. See §5a Problem 1. |
+| **Confirmed** — `Unable to bootstrap inner kit kernel: EOF when reading a line`, log shows `Do you accept the EULA? (Yes/No):` | Isaac Sim's first-run EULA prompt is interactive and the shell is non-interactive | Write `yes` to `<venv>\Lib\site-packages\isaacsim\kit\EULA_ACCEPTED`, or set `OMNI_KIT_ACCEPT_EULA=Y`. See §5a Problem 2. |
+| **Confirmed** — `ImportError: DLL load failed while importing _errors` (h5py) while `isaaclab_tasks` extension loads, followed by `Windows fatal exception: code 0xc0000139` | Kit loads a native library that shadows h5py's bundled HDF5 DLLs before `isaaclab_tasks` imports h5py | `import h5py` at the very top of any script that calls `AppLauncher`, before Isaac Sim boots. Already applied to all 5 affected scripts. See §5a Problem 3. |
+| **Confirmed, intermittent** — `ValueError: '/rtx/translucency/reflectAtAllBounce' in RenderCfg.general_parameters does not map to a carb setting.` during `gym.make()` | Race condition: Kit's background extension loading hasn't finished registering RTX renderer settings yet when `SimulationContext` validates them | No code fix applied — just retry the same command. See §5a Problem 4. |
+| `ModuleNotFoundError: No module named 'isaaclab'` | Running with system/plain Python instead of the Isaac Lab venv's interpreter | Always invoke via `Y:\e\Scripts\python.exe`, never a bare `python ...` |
+| `list_envs` shows an empty/short table | `sim_to_real_so101` not installed in editable mode, or installed into the wrong Python | `pip install -e source/sim_to_real_so101` into `Y:\e`'s pip; confirm with `pip show sim_to_real_so101` |
+| `ImportError` mentioning `lerobot` | Ran `lerobot_agent.py`, the **hardware** teleop script requiring a real leader arm | Not needed — use the keyboard-jog script once it exists (§7) |
+| `TypeError` inside `torch.linalg.vector_norm` / `torch.cat` on `.data.*` values | Running under Isaac Lab 3.0's Warp-based `.data.*` without the compatibility shim | Apply the `as_torch()` shim from §6 at every `.data.*` call site (already applied — no-op on the currently-installed 2.3.2) |
+| USD asset fails to load (`SO-ARM101-USD.usd` not found) | Package not installed with `-e`, so `here = os.path.dirname(...)` in `so101.py` resolves to a stale location | Reinstall with `pip install -e`, don't use a non-editable install |
+| `Y:` drive missing / venv unreachable after a reboot | `subst` mapping is session-only and didn't get recreated | Check `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\restore_ilab_subst.bat` exists; run `subst Y: C:\ilab` manually if needed |

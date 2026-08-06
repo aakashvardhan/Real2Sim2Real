@@ -30,12 +30,6 @@ with `Isaac` in their name.
 
 """Launch Isaac Sim Simulator first."""
 
-# Import h5py before Isaac Sim/Kit boots: Kit loads its own native libraries
-# (e.g. z.dll) that can shadow h5py's bundled HDF5 DLLs on Windows, causing
-# "DLL load failed while importing _errors" once isaaclab_tasks imports h5py
-# later. Importing it first locks in h5py's own DLLs before the conflict can occur.
-import h5py  # noqa: F401
-
 from isaaclab.app import AppLauncher
 
 # launch omniverse app

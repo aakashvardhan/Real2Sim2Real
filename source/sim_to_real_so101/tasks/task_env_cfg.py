@@ -15,6 +15,7 @@
 import os
 import numpy as np
 
+import carb
 import isaaclab.sim as sim_utils
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
@@ -241,12 +242,36 @@ class SO101TaskEnvCfg(SO101TeleopEnvCfg):
         super().__post_init__()
 
         self.sim.render.enable_translucency = True
-        carb_settings = {
-            "rtx.reflections.enabled": True,
-            "rtx.translucency.reflectAtAllBounce": True,
-            "rtx.translucency.sampleRoughness": True,
-            "rtx.translucency.reflectionThroughputThreshold": 0.05,
-            "rtx.translucency.maxRefractionBounces": 5,
-            "rtx.raytracing.fractionalCutoutOpacity": True,
-        }
-        self.sim.render.carb_settings = carb_settings
+        # The RTX translucency/reflection settings for the glass vials are
+        # deliberately NOT set here via `self.sim.render.carb_settings`.
+        # Isaac Lab validates every key in that dict against
+        # `carb.settings.get_setting()` *during* `gym.make()`, but the RTX
+        # renderer extension registers these specific settings on a
+        # background thread -- `gym.make()` can (and, on this machine, does
+        # reliably) win that race and raise "does not map to a carb
+        # setting". See `apply_rtx_translucency_settings()` below, called
+        # after `gym.make()` returns instead.
+
+
+RTX_TRANSLUCENCY_CARB_SETTINGS = {
+    "/rtx/reflections/enabled": True,
+    "/rtx/translucency/reflectAtAllBounce": True,
+    "/rtx/translucency/sampleRoughness": True,
+    "/rtx/translucency/reflectionThroughputThreshold": 0.05,
+    "/rtx/translucency/maxRefractionBounces": 5,
+    "/rtx/raytracing/fractionalCutoutOpacity": True,
+}
+
+
+def apply_rtx_translucency_settings() -> None:
+    """Applies the glass-vial RTX settings once the sim is fully constructed.
+
+    Call this right after ``gym.make()`` returns. By then the RTX renderer
+    extension has finished registering these settings, so the plain
+    (non-validating) ``carb.settings.get_settings().set()`` API can set them
+    directly without racing Isaac Lab's stricter `sim.render.carb_settings`
+    validation path -- see the note in `SO101TaskEnvCfg.__post_init__`.
+    """
+    settings = carb.settings.get_settings()
+    for key, value in RTX_TRANSLUCENCY_CARB_SETTINGS.items():
+        settings.set(key, value)

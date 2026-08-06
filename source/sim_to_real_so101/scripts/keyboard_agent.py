@@ -12,6 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Keyboard-jog teleop agent: no physical leader arm required.
+
+Drives the SO-101's 6 joints directly with per-joint keyboard jogging
+(held key -> continuous +/- delta on that joint's target position) instead
+of a hardware leader arm over serial, for machines without one. See
+docs/isaac-sim-windows-guide.md section 7 for why this exists.
+"""
 import argparse
 import os
 
@@ -24,7 +31,7 @@ import h5py  # noqa: F401
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Isaac Lab SO-101 Teleop agent.")
+parser = argparse.ArgumentParser(description="Isaac Lab SO-101 keyboard-jog teleop agent.")
 parser.add_argument(
     "--disable_fabric",
     action="store_true",
@@ -36,16 +43,10 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
-    "--port",
-    type=str,
-    default=os.getenv("TELEOP_PORT", "/dev/ttyACM0"),
-    help="Port of the robot.",
-)
-parser.add_argument(
-    "--robot_id",
-    type=str,
-    default=os.getenv("TELEOP_ID", "leader_arm_1"),
-    help="ID of the robot.",
+    "--joint_step",
+    type=float,
+    default=0.01,
+    help="Radians added/removed from a joint's target per physics step while its jog key is held.",
 )
 parser.add_argument(
     "--repo_id", type=str, default=None, help="Repository ID to store the dataset."
@@ -89,21 +90,23 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
-import time
 
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 import sim_to_real_so101.tasks  # noqa: F401
 from sim_to_real_so101.tasks.task_env_cfg import apply_rtx_translucency_settings
-from sim_to_real_so101.utils.keyboard import KeyboardControl
-from sim_to_real_so101.utils.lerobot_interface import LeRobotSO101Interface
-from sim_to_real_so101.utils.lerobot_recorder import LeRobotRecorder
+from sim_to_real_so101.utils.keyboard import JointJogKeyboardControl
+
+# LeRobotSO101Interface/LeRobotRecorder both import the `lerobot` pip package,
+# which isn't installed by this repo's Isaac Lab pip install (only pulled in
+# separately for hardware teleop). Deferred so plain keyboard jogging works
+# without it -- only imported below if recording is actually requested.
 
 
 def main():
 
-    keyboard_control = KeyboardControl()
+    keyboard_control = JointJogKeyboardControl()
 
     # parse configuration
     env_cfg = parse_env_cfg(
@@ -123,8 +126,13 @@ def main():
     # print info (this is vectorized environment)
     print(f"[INFO]: Gym observation space: {env.observation_space}")
     print(f"[INFO]: Gym action space: {env.action_space}")
+    print(f"[INFO]: Keyboard jog controls (hold to move, release to stop):")
+    for joint in JointJogKeyboardControl.JOINT_ORDER:
+        pos_key, neg_key = JointJogKeyboardControl.JOINT_KEYS[joint]
+        print(f"    {joint:<12s}  {pos_key} (+)  /  {neg_key} (-)")
     print(f"[INFO]: Click 'R' to reset the world")
     print(f"[INFO]: Click 'S' to start/stop recording; 'R' will also stop recording")
+    print(f"[INFO]: Click 'C' to cancel an in-progress recording")
 
     # reset environment
     env.reset()
@@ -142,21 +150,14 @@ def main():
     if len(cameras) == 0:
         print(f"[Info]: No cameras found - videos will not be recorded")
 
-    robot_iface = LeRobotSO101Interface(
-        device=env.unwrapped.device,
-        port=args_cli.port,
-        id=args_cli.robot_id,
-        cameras=cameras,
-        fps=30,
-        kind="leader",
-    )
-    robot_iface.init_device()
-    robot_iface.connect()
+    robot = env.unwrapped.scene["robot"]
+    joint_indices = [robot.joint_names.index(name) for name in JointJogKeyboardControl.JOINT_ORDER]
+    default_targets = robot.data.default_joint_pos[0, joint_indices].clone()
+    joint_limits = robot.data.soft_joint_pos_limits[0, joint_indices]  # (6, 2) -> [lower, upper]
+    targets = default_targets.clone()
 
     # Allocate action tensor
     actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
-
-    # simulate environment
 
     # Recording dataset
     if all([args_cli.repo_id, args_cli.repo_root, args_cli.task_name]):
@@ -165,6 +166,25 @@ def main():
         recording_mode = False
 
     if recording_mode:
+        # Deferred: both pull in the `lerobot` pip package, not installed by
+        # this repo's Isaac Lab pip install. Only needed when recording is
+        # requested -- see the module-level note near the top of this file.
+        from sim_to_real_so101.utils.lerobot_interface import LeRobotSO101Interface
+        from sim_to_real_so101.utils.lerobot_recorder import LeRobotRecorder
+
+        # Reused only for its sim<->real unit-conversion helpers (static joint-range
+        # lookups, not a live connection) so recorded datasets stay in the same
+        # degree-space convention lerobot_agent.py's hardware-teleop recordings use.
+        # init_device()/connect() are intentionally not called -- no physical arm.
+        robot_iface = LeRobotSO101Interface(
+            device=env.unwrapped.device,
+            port="",
+            id="keyboard_jog",
+            cameras=cameras,
+            fps=30,
+            kind="leader",
+        )
+
         recorder = LeRobotRecorder(
             task_name=args_cli.task_name,
             repo_id=args_cli.repo_id,
@@ -186,17 +206,20 @@ def main():
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
-            real_action = robot_iface.robot.get_action()
-            real_action, mapped_action = robot_iface.real_to_sim_obs_processor(
-                real_action
-            )
-            actions[:] = mapped_action
+            deltas = keyboard_control.get_joint_deltas(args_cli.joint_step)
+            deltas = torch.tensor(deltas, device=targets.device, dtype=targets.dtype)
+            targets = torch.clamp(targets + deltas, joint_limits[:, 0], joint_limits[:, 1])
+
+            # single-arm jog target is broadcast to every parallel env, since
+            # there's only one keyboard driving them
+            actions[:, :] = targets
 
             obs, _, _, _, _ = env.step(actions)
 
             if keyboard_control.reset_world:
                 keyboard_control.reset_world = False
                 env.reset()
+                targets = default_targets.clone()
                 continue
 
             if recording_mode and keyboard_control.recording:
@@ -210,6 +233,7 @@ def main():
                 # Extract joint positions from policy observation dict
                 joint_pos_obs = obs["policy"]["joint_pos_obs"][0]
                 visual_obs = obs["visual"]
+                real_action = robot_iface.get_raw_actions_from_radians(targets)
                 real_obs, visual_buffers, depth_buffers, instance_id_seg_buffers = (
                     robot_iface.sim_to_real_dataset_processor(joint_pos_obs, visual_obs)
                 )

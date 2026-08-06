@@ -101,6 +101,75 @@ class KeyboardControl:
             self.recording = False
 
             omni.kit.app.queue_event(
-                self.CANCEL_RECORDING_EVENT, 
+                self.CANCEL_RECORDING_EVENT,
                 payload={}
                 )
+
+
+class JointJogKeyboardControl(KeyboardControl):
+    """Extends KeyboardControl with continuous per-joint jogging.
+
+    Tracks which jog keys are currently held (not just pressed) so a caller
+    can poll ``get_joint_deltas`` once per physics step and get a continuous
+    +/- delta for as long as a key stays down, rather than a one-shot flag.
+    """
+
+    JOINT_ORDER = ["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw"]
+
+    # (increase_key, decrease_key) per joint. Deliberately disjoint from R/S/C
+    # (reset/start-stop-recording/cancel-recording) so no key does double duty.
+    JOINT_KEYS = {
+        "Rotation": ("D", "A"),
+        "Pitch": ("W", "X"),
+        "Elbow": ("E", "V"),
+        "Wrist_Pitch": ("T", "G"),
+        "Wrist_Roll": ("Y", "H"),
+        "Jaw": ("U", "J"),
+    }
+
+    def __init__(self):
+        self._held_keys = set()
+        self._key_lookup = {}
+        for joint_index, joint in enumerate(self.JOINT_ORDER):
+            pos_key, neg_key = self.JOINT_KEYS[joint]
+            self._key_lookup[pos_key] = (joint_index, 1.0)
+            self._key_lookup[neg_key] = (joint_index, -1.0)
+        super().__init__()
+
+    def _on_keyboard_event(self, event, *args, **kwargs):
+        # Let the base class handle R/S/C first.
+        if super()._on_keyboard_event(event, *args, **kwargs):
+            return True
+
+        # Kit also dispatches non-press/release event types (e.g. CHAR) on
+        # this same callback, where `event.input` is a plain str with no
+        # `.name` -- only KEY_PRESS/KEY_RELEASE carry a KeyboardInput enum.
+        # Confirmed by hitting `AttributeError: 'str' object has no
+        # attribute 'name'` during a smoke test: some non-key event fired
+        # continuously even with no human at the keyboard.
+        if event.type not in (
+            carb.input.KeyboardEventType.KEY_PRESS,
+            carb.input.KeyboardEventType.KEY_RELEASE,
+        ):
+            return False
+
+        key_name = event.input.name
+        if key_name not in self._key_lookup:
+            return False
+
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            self._held_keys.add(key_name)
+        else:
+            self._held_keys.discard(key_name)
+        return True
+
+    def get_joint_deltas(self, step: float) -> list[float]:
+        """Per-joint delta for this tick, ``+step``/``-step`` per held key.
+
+        A joint with both its keys held cancels out to 0.
+        """
+        deltas = [0.0] * len(self.JOINT_ORDER)
+        for key_name in self._held_keys:
+            joint_index, sign = self._key_lookup[key_name]
+            deltas[joint_index] += sign * step
+        return deltas

@@ -27,8 +27,6 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.assets import Articulation, RigidObject
 from isaacsim.core.prims import XFormPrim
 
-from ._compat import as_torch
-
 
 
 
@@ -290,7 +288,7 @@ def random_asset_pose(
         pos_offset
 ):
 
-    root_states = as_torch(asset.data.default_root_state)[env_ids].clone()
+    root_states = asset.data.default_root_state[env_ids].clone()
     pos_offset_list = [pos_offset.get(key, 0.0) for key in ["x", "y", "z"]]
     pos_offset = torch.tensor(pos_offset_list, device=asset.device)
     range_list = [
@@ -378,7 +376,7 @@ def reset_vials_rack(
     pose_range_z_fixed = {**pose_range, "z": (0.0, 0.0)}
     for i, v in enumerate(vial_objects):
         if i not in placed_on_rack_indices:
-            default_z = as_torch(v.data.default_root_state)[env_ids[0], 2].item()
+            default_z = v.data.default_root_state[env_ids[0], 2].item()
             pos_offset = {"z": fixed_vial_z - default_z}
             _, _ = random_asset_pose(env, env_ids, v, pose_range_z_fixed, pos_offset)
             zero_velocity = torch.zeros((len(env_ids), 6), device=v.device)
