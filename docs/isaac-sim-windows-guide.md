@@ -13,8 +13,10 @@ your own machine.
 ## 1. The three tasks
 
 1. **Log into Omniverse and confirm Isaac Sim can simulate the SO-101 arm doing pick-and-place via
-   teleoperation.** Status: sim confirmed working (§5a); keyboard-jog teleop script not yet written
-   (§7).
+   teleoperation.** Status: sim confirmed working (§5a); keyboard-jog teleop script written and two
+   real bugs found + fixed via automated smoke testing (§7) — **still needs your hands on the
+   keyboard** for the one thing that can't be automated: confirming the arm actually moves when you
+   hold a jog key.
 2. **(Aakash)** Open USD Composer, check for existing scene templates, and build a simple indoor
    environment scene. **Status: done, see §10** — built programmatically rather than by hand in
    Composer's GUI (this session can't drive a GUI app); still needs a visual look-over in Composer.
@@ -48,10 +50,10 @@ your own machine.
   ([lerobot_interface.py:21](../source/sim_to_real_so101/utils/lerobot_interface.py#L21)). There is
   no keyboard/SpaceMouse/gamepad device wired to the SO-101's joints anywhere in the codebase
   (confirmed by grep) — `zero_agent`/`random_agent` are non-interactive debug scripts only.
-  - **Decision made**: since no physical leader arm is being used, teleop will be demonstrated via a
-    **new keyboard-jogging script** (not yet written) that replaces `LeRobotSO101Interface` as the
-    action source with per-joint key mappings, reusing the camera/recording scaffolding from
-    `lerobot_agent.py`. See §6.
+  - **Decision made**: since no physical leader arm is being used, teleop is demonstrated via a
+    **new keyboard-jogging script**, [keyboard_agent.py](../source/sim_to_real_so101/scripts/keyboard_agent.py),
+    that replaces `LeRobotSO101Interface` as the action source with per-joint key mappings, reusing
+    the camera/recording scaffolding from `lerobot_agent.py`. See §7.
 
 ## 3. What's actually installed on this machine
 
@@ -248,16 +250,15 @@ was left alone):
 `random_agent.py.bak`, `lerobot_agent.py.bak`, `lerobot_eval.py.bak`, all in `scripts/`). Copy a
 `.bak` back over its counterpart to undo.
 
-### Problem 4: intermittent carb render-settings crash — a race condition, not a real incompatibility
+### Problem 4: carb render-settings race during `gym.make()` — was intermittent, then became a 5/5 blocker, now fixed
 
 `zero_agent --task Lerobot-So101-Teleop-Vials-To-Rack` sometimes crashed during `gym.make()` with:
 ```
 ValueError: '/rtx/translucency/reflectAtAllBounce' in RenderCfg.general_parameters does not map to a carb setting.
 ```
-raised from `isaaclab/sim/simulation_context.py`'s `_apply_render_settings_from_cfg`, which validates
-every key in the `carb_settings` dict this repo sets in
-[task_env_cfg.py:239-252](../source/sim_to_real_so101/tasks/task_env_cfg.py#L239-L252) (RTX
-translucency settings for the glass vials) by calling `get_setting(key)` and raising if it returns
+raised from `isaaclab/sim/simulation_context.py`'s `_apply_render_settings_from_cfg`, which validated
+every key in the `carb_settings` dict this repo set in `SO101TaskEnvCfg.__post_init__` (RTX
+translucency settings for the glass vials) by calling `get_setting(key)` and raising if it returned
 `None`.
 
 **Investigation**: a standalone script that booted `AppLauncher` and checked all 6 settings
@@ -268,12 +269,27 @@ identical settings. **Conclusion: Kit loads extensions partly via background thr
 `gym.make()` can call `SimulationContext.__init__()` before the RTX renderer extension has finished
 registering these specific settings — a timing race, not a hard incompatibility.**
 
-**No code change applied** — retrying the same command is the practical workaround if this is hit
-again. If it becomes a frequent annoyance, the more permanent fix would be moving these RTX
-translucency settings out of `EnvCfg.__post_init__`'s strictly-validated `carb_settings` dict and
-into a direct `carb.settings.get_settings().set(path, value)` call made *after* `gym.make()` returns
-(that API doesn't validate pre-existence the way Isaac Lab's config path does) — not yet needed since
-this hasn't recurred often enough to justify the change.
+**Escalation**: while smoke-testing the new `keyboard_agent.py` (§7) in this same session, this race
+went from "sometimes" to **5/5 consecutive failures** — every single `gym.make()` attempt hit it.
+That crossed the threshold from "retry and move on" to "worth actually fixing."
+
+**Fix applied**: the RTX translucency/reflection settings are no longer set via
+`self.sim.render.carb_settings` in `SO101TaskEnvCfg.__post_init__`
+([task_env_cfg.py](../source/sim_to_real_so101/tasks/task_env_cfg.py)) — that's the strictly-validated
+path that raced the RTX extension's own registration. Instead:
+- `task_env_cfg.py` now exposes `RTX_TRANSLUCENCY_CARB_SETTINGS` (the same 6 settings, as `/rtx/...`
+  paths) and `apply_rtx_translucency_settings()`, which sets them via the plain, non-validating
+  `carb.settings.get_settings().set(key, value)` API — no existence check, no race.
+- Every script that calls `gym.make()` for this task now calls `apply_rtx_translucency_settings()`
+  immediately after, once the sim is fully constructed and the race window has passed:
+  [zero_agent.py](../source/sim_to_real_so101/scripts/zero_agent.py),
+  [random_agent.py](../source/sim_to_real_so101/scripts/random_agent.py),
+  [lerobot_agent.py](../source/sim_to_real_so101/scripts/lerobot_agent.py),
+  [lerobot_eval.py](../source/sim_to_real_so101/scripts/lerobot_eval.py),
+  [keyboard_agent.py](../source/sim_to_real_so101/scripts/keyboard_agent.py).
+
+**Verified**: re-ran the `keyboard_agent.py` smoke test after the fix — the `ValueError` no longer
+occurs (confirmed on a run that previously failed 5/5 times before the fix).
 
 ### Unrelated, non-fatal noise seen in the logs
 
@@ -302,9 +318,11 @@ assuming a stall; the render loop doesn't log anything once it's just running.
 ```powershell
 Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.list_envs
 Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.zero_agent --task Lerobot-So101-Teleop-Vials-To-Rack
+Y:\e\Scripts\python.exe -m sim_to_real_so101.scripts.keyboard_agent --task Lerobot-So101-Teleop-Vials-To-Rack
 ```
 (`Y:` must be mapped first — the startup script above handles this automatically after a reboot; if
-it's a fresh session and `Y:` isn't mapped yet, run `subst Y: C:\ilab` manually.)
+it's a fresh session and `Y:` isn't mapped yet, run `subst Y: C:\ilab` manually.) For
+`keyboard_agent.py`'s key mapping and usage, see §7.
 
 ## 6. Proof: Isaac Lab 3.0 Beta would break this repo's existing MDP code
 
@@ -382,7 +400,7 @@ and only becomes load-bearing if/when the project moves to Isaac Lab 3.0.
 `mdp/obs.py.bak`, `mdp/terms.py.bak`, `mdp/resets.py.bak`. To roll back, copy a `.bak` file over its
 counterpart (e.g. `copy mdp\obs.py.bak mdp\obs.py` on Windows) and delete `mdp/_compat.py`.
 
-## 7. Task 1, revised: keyboard teleop instead of hardware
+## 7. Task 1: keyboard teleop instead of hardware
 
 Since no physical leader arm is being used, "teleoperation" needs a new input source. The chosen
 approach: **per-joint keyboard jogging**, mapping key pairs to +/- deltas on each of the SO-101's 6
@@ -397,11 +415,70 @@ end-effector pose deltas for IK-based control, but this repo's action space is r
 [so101_env_cfg.py:71-76](../source/sim_to_real_so101/tasks/so101_env_cfg.py#L71-L76)), so it doesn't
 plug in without adding a new IK action term. Per-joint jogging avoids that extra work.
 
-**Not yet implemented**: a `keyboard_agent.py` script (sibling to `lerobot_agent.py`) that keeps the
-camera/recording scaffolding but replaces `robot_iface.robot.get_action()`
-([lerobot_agent.py:177](../source/sim_to_real_so101/scripts/lerobot_agent.py#L177)) with the
-keyboard-jog action source, and an extended `KeyboardControl` with continuous held-key state
-tracking.
+### Implemented: `keyboard_agent.py` + `JointJogKeyboardControl`
+
+[keyboard_agent.py](../source/sim_to_real_so101/scripts/keyboard_agent.py) is a sibling to
+`lerobot_agent.py` that keeps the same camera-detection and recording scaffolding but replaces
+`robot_iface.robot.get_action()` (the hardware leader-arm read) with a keyboard-jog target computed
+each physics step.
+
+`JointJogKeyboardControl` in
+[keyboard.py](../source/sim_to_real_so101/utils/keyboard.py) subclasses `KeyboardControl`, adding
+continuous held-key tracking (press adds a key to a `_held_keys` set, release removes it) and
+`get_joint_deltas(step)`, which returns a `+step`/`-step` per joint for every currently-held key.
+Key mapping (deliberately disjoint from R/S/C so no key does double duty):
+
+| Joint | Increase (+) | Decrease (−) |
+|---|---|---|
+| Rotation (base yaw) | `D` | `A` |
+| Pitch (shoulder) | `W` | `X` |
+| Elbow | `E` | `V` |
+| Wrist_Pitch | `T` | `G` |
+| Wrist_Roll | `Y` | `H` |
+| Jaw (gripper) | `U` | `J` |
+
+Each physics step, `keyboard_agent.py` reads the current deltas, adds them to a running per-joint
+target tensor, clamps against `robot.data.soft_joint_pos_limits` (read from the articulation itself,
+not hardcoded), and steps the env with that as the action — matching
+`ActionsCfg.joint_positions`'s `scale=1, use_default_offset=False` convention (raw radians, absolute
+target, same order as `JOINT_ORDER`). `R`/`S`/`C` (reset/record/cancel) still work unchanged via the
+base class.
+
+**Recording is optional and its import is deferred**: `LeRobotSO101Interface`/`LeRobotRecorder` both
+import the `lerobot` pip package, which — confirmed by direct check — **is not installed** in the
+`Y:\e` venv (only `isaaclab[isaacsim,all]` and this repo's own package are). If those imports were
+unconditional at module load, plain jogging (no `--repo_id`/`--repo_root`/`--task_name`) would fail
+to even start. They're imported lazily inside the `if recording_mode:` block instead, so core jogging
+never needs `lerobot` installed at all. When recording *is* requested, `LeRobotSO101Interface` is
+still constructed (for its static degree↔radian conversion helpers only — `init_device()`/`connect()`
+are never called, so no physical arm is needed even then), and `real_action` for each recorded frame
+is computed from the commanded target via `get_raw_actions_from_radians(targets)` rather than read
+from real hardware.
+
+### Two real bugs found by automated smoke testing, both fixed
+
+Since this assistant can't press and hold a physical key, verification leaned on running
+`keyboard_agent.py` non-interactively with a bounded timeout and reading the Kit log — this caught
+two genuine bugs before a human ever touched the script:
+
+1. **The Problem 4 carb-settings race (above)**, which had gone from "intermittent" in earlier
+   sessions to a **5/5 failure rate** in this one — fixed by moving the RTX settings out of the
+   validated `carb_settings` path.
+2. **A crash in `JointJogKeyboardControl._on_keyboard_event` itself**: it read `event.input.name`
+   unconditionally, but Kit also dispatches non-press/release keyboard event types (their `event.input`
+   is a plain `str` with no `.name`) through the same callback. Once past the carb-settings race, a
+   ~5-minute smoke test showed this crashing **hundreds of times in a row** with
+   `AttributeError: 'str' object has no attribute 'name'` — apparently some non-key event fires
+   continuously even with no human at the keyboard. Kit swallows exceptions raised inside an
+   event-callback subscriber rather than crashing the app, so the process stayed alive throughout,
+   but the handler was never doing anything useful. **Fix**: check `event.type` is `KEY_PRESS` or
+   `KEY_RELEASE` *before* touching `event.input.name`, mirroring the base `KeyboardControl` class's
+   own (already-safe) pattern. Re-tested after the fix: zero tracebacks over a multi-minute run.
+
+**What's still unverified**: whether the arm actually visually moves in the viewport when a jog key
+is held. That requires a real window with keyboard focus and a human pressing keys — nothing an
+automated terminal session can produce. Both bugs found by smoke testing are fixed; this last check
+is the one thing left for you to confirm.
 
 ## 8. Getting started today (tasks 2 and most of task 3)
 
@@ -574,10 +651,11 @@ haven't necessarily been hit yet.)*
 | **Confirmed** — `pip install` fails with `OSError: [Errno 2] No such file or directory` deep inside `isaacsim\extscache\isaacsim.replicator.caption.core-...\tests\test_data\...` | Windows `MAX_PATH` (260 char) limit hit by deeply nested test-data files in the `isaacsim-replicator` package | No admin rights → use `subst Y: C:\<short-folder>` and install into `Y:\...` instead of a long path like `Desktop\env_isaaclab`. See §5a Problem 1. |
 | **Confirmed** — `Unable to bootstrap inner kit kernel: EOF when reading a line`, log shows `Do you accept the EULA? (Yes/No):` | Isaac Sim's first-run EULA prompt is interactive and the shell is non-interactive | Write `yes` to `<venv>\Lib\site-packages\isaacsim\kit\EULA_ACCEPTED`, or set `OMNI_KIT_ACCEPT_EULA=Y`. See §5a Problem 2. |
 | **Confirmed** — `ImportError: DLL load failed while importing _errors` (h5py) while `isaaclab_tasks` extension loads, followed by `Windows fatal exception: code 0xc0000139` | Kit loads a native library that shadows h5py's bundled HDF5 DLLs before `isaaclab_tasks` imports h5py | `import h5py` at the very top of any script that calls `AppLauncher`, before Isaac Sim boots. Already applied to all 5 affected scripts. See §5a Problem 3. |
-| **Confirmed, intermittent** — `ValueError: '/rtx/translucency/reflectAtAllBounce' in RenderCfg.general_parameters does not map to a carb setting.` during `gym.make()` | Race condition: Kit's background extension loading hasn't finished registering RTX renderer settings yet when `SimulationContext` validates them | No code fix applied — just retry the same command. See §5a Problem 4. |
+| **Confirmed, fixed** — `ValueError: '/rtx/translucency/reflectAtAllBounce' in RenderCfg.general_parameters does not map to a carb setting.` during `gym.make()` | Race condition: Kit's background extension loading hadn't finished registering RTX renderer settings yet when `SimulationContext` validated them | Fixed in code — RTX settings now applied via `apply_rtx_translucency_settings()` after `gym.make()` returns, not through the strictly-validated `carb_settings` path. See §5a Problem 4. |
+| **Confirmed, fixed** — `AttributeError: 'str' object has no attribute 'name'` spamming from `keyboard.py`'s `_on_keyboard_event` | `JointJogKeyboardControl` read `event.input.name` unconditionally; non-press/release keyboard event types carry a plain `str` with no `.name` | Fixed in code — `event.type` is checked against `KEY_PRESS`/`KEY_RELEASE` before touching `.input.name`. See §7. |
 | `ModuleNotFoundError: No module named 'isaaclab'` | Running with system/plain Python instead of the Isaac Lab venv's interpreter | Always invoke via `Y:\e\Scripts\python.exe`, never a bare `python ...` |
 | `list_envs` shows an empty/short table | `sim_to_real_so101` not installed in editable mode, or installed into the wrong Python | `pip install -e source/sim_to_real_so101` into `Y:\e`'s pip; confirm with `pip show sim_to_real_so101` |
-| `ImportError` mentioning `lerobot` | Ran `lerobot_agent.py`, the **hardware** teleop script requiring a real leader arm | Not needed — use the keyboard-jog script once it exists (§7) |
+| `ImportError` mentioning `lerobot` | Ran `lerobot_agent.py` (hardware teleop, needs a real leader arm) or `keyboard_agent.py` **with** `--repo_id`/`--repo_root`/`--task_name` (recording mode) — the `lerobot` pip package isn't installed in `Y:\e`. Confirmed by direct check. | For teleop without hardware, use `keyboard_agent.py` (§7) *without* recording flags — recording's `lerobot` import is deferred and only needed if you actually pass those flags. To use recording, `pip install lerobot` into `Y:\e` first. |
 | `TypeError` inside `torch.linalg.vector_norm` / `torch.cat` on `.data.*` values | Running under Isaac Lab 3.0's Warp-based `.data.*` without the compatibility shim | Apply the `as_torch()` shim from §6 at every `.data.*` call site (already applied — no-op on the currently-installed 2.3.2) |
 | USD asset fails to load (`SO-ARM101-USD.usd` not found) | Package not installed with `-e`, so `here = os.path.dirname(...)` in `so101.py` resolves to a stale location | Reinstall with `pip install -e`, don't use a non-editable install |
 | `Y:` drive missing / venv unreachable after a reboot | `subst` mapping is session-only and didn't get recreated | Check `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\restore_ilab_subst.bat` exists; run `subst Y: C:\ilab` manually if needed |
