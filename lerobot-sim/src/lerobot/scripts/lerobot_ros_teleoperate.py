@@ -75,25 +75,23 @@ from lerobot.processor import (
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_so100_follower,
+    bi_so_follower,
     hope_jr,
     koch_follower,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
+    so_follower,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
-    bi_so100_leader,
+    bi_so_leader,
     gamepad,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
-    so100_leader,
-    so101_leader,
+    so_leader,
 )
-from lerobot.utils.import_utils import register_third_party_devices
+from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
@@ -372,7 +370,7 @@ def ros_teleoperate(cfg: ROSTeleoperateConfig):
 
 
 def main():
-    register_third_party_devices()
+    register_third_party_plugins()
     ros_teleoperate()
 
 

@@ -40,7 +40,7 @@ from pathlib import Path
 import draccus
 from lerobot.motors.motors_bus import MotorCalibration
 from lerobot.robots import make_robot_from_config
-from lerobot.robots.so101_follower import SO101FollowerConfig
+from lerobot.robots.so_follower import SO101FollowerConfig
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION
 from lerobot.utils.utils import init_logging
 
@@ -197,7 +197,7 @@ def main():
     init_logging()
 
     robot_id = os.getenv("ROBOT_ID", "follower_arm_1")
-    calib_path = HF_LEROBOT_CALIBRATION / "robots" / "so101_follower" / f"{robot_id}.json"
+    calib_path = HF_LEROBOT_CALIBRATION / "robots" / "so_follower" / f"{robot_id}.json"
 
     if not calib_path.exists():
         logging.error(f"Calibration file not found: {calib_path}")

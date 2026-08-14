@@ -29,10 +29,9 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     koch_follower,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
+    so_follower,
 )
-from lerobot.robots.so101_follower import SO101FollowerConfig
+from lerobot.robots.so_follower import SO101FollowerConfig
 from lerobot.utils.utils import init_logging
 import rerun as rr
 
