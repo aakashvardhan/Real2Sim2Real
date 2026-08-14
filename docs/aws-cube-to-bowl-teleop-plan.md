@@ -13,6 +13,68 @@ Status: **planning only, not yet implemented.**
 
 ---
 
+## 0. Workflow diagram
+
+The mechanism this plan hinges on: the real leader arm's raw joint angles have to cross a
+unit boundary (degrees, real motor range → radians, sim joint range) before they can drive
+the articulation, and the actual pick-and-place is a physical contact chain (jaw → cube →
+bowl), not a scripted move. Dataset recording is a one-way tap off the loop, not part of it.
+
+```mermaid
+flowchart LR
+    subgraph PHYS["Physical world"]
+        LEADER["SO-101 leader arm<br/>COM4, serial"]
+    end
+
+    subgraph HOST["lerobot_agent.py — every control tick"]
+        CONV["unit conversion<br/>deg + real joint range<br/>&#8594; rad + sim joint range"]
+    end
+
+    subgraph SIMENV["Isaac Sim env: Aws-Cube-To-Bowl"]
+        JOINTS["6 joint drives<br/>Rotation ... Jaw"]
+        GRIP["gripper / jaw"]
+        CUBE["AWSBuilderCube<br/>dynamic rigid body"]
+        BOWL["PaperBowl<br/>static"]
+    end
+
+    REC["LeRobotRecorder"]
+    DISK[("dataset on disk")]
+
+    LEADER -- "raw joint angles (deg)" --> CONV
+    CONV -- "env.step(action), rad" --> JOINTS
+    JOINTS -- "drives" --> GRIP
+    GRIP -- "contact / friction" --> CUBE
+    CUBE -. "released, resting in" .-> BOWL
+    JOINTS -- "obs: joint_pos, ee_frame" --> CONV
+    CONV -. "only if --repo_id set" .-> REC
+    REC --> DISK
+```
+
+`CONV` is `LeRobotSO101Interface.real_to_sim_obs_processor()` /
+`get_mapped_actions_vectorized()` in
+[`utils/lerobot_interface.py`](../source/sim_to_real_so101/utils/lerobot_interface.py); the
+whole left-to-right pass through `CONV` → `JOINTS` → obs-return repeats every control tick for
+as long as `lerobot_agent.py` runs. The `GRIP`→`CUBE`→`BOWL` chain only exists once §3/§4's
+rigid-body work (`AWSBuilderCube.usda`) is in place — today the cube is frozen geometry, so
+that segment of the diagram is the part this plan actually has to build.
+
+**No ROS2 anywhere in this diagram — deliberately, not by oversight.** There's a separate
+ROS2 pathway in this repo's dependency tree: `lerobot-ros-teleoperate`
+(`lerobot-sim/src/lerobot/scripts/lerobot_ros_teleoperate.py`, a real registered entry point —
+see `lerobot-sim/pyproject.toml:311`) publishes joint states to a `/joint_states` ROS2 topic
+every cycle; a `ros2 run topic_tools relay /joint_states /isaac_joint_command` node bridges
+that into Isaac Sim, opened directly in the GUI with a ROS2 OmniGraph subscriber already wired
+into the scene (documented in `lerobot-sim/SO-ARM101-ISAAC-SIM-GUIDE.md` and
+`lerobot-sim/PROTOMOTA_README.md` — also where the `armatron`/`armatron_leader` example IDs in
+`lerobot-sim/CLAUDE.md` come from, a different context than this repo's own `my_so_arm`
+calibration files). It's real and runnable, but it's pure joint-mirroring visualization — no
+gym env, no contact sensors, no rigid-body task objects, no reward/termination — it can't run
+a physics-driven pick-and-place task at all. Confirmed zero references to it anywhere in
+`source/sim_to_real_so101/`, `docker/`, or this project's own docs; it's inherited from the
+vendored `lerobot` fork's broader feature set, not wired into this project's actual pipeline.
+This plan's diagram reflects `lerobot_agent.py`'s real mechanism: direct Python calls
+(`env.step()`), no message broker.
+
 ## 1. What already exists — don't rebuild it
 
 - [`scripts/lerobot_agent.py`](../source/sim_to_real_so101/scripts/lerobot_agent.py) +
@@ -39,10 +101,10 @@ gotcha hit while doing this.
 
 | Prim | State | Implication |
 |---|---|---|
-| `/World/SO_ARM101_USD` | world pos `(0, 0.3, 0.72)`, references `SO-ARM101-USD.usd` | Reuse `SO101_CFG`, override `init_state.pos/rot` only |
-| `/World/AWSBuilderCube` | mesh `AWSBuilderCube_Geo`: extent ±0.025 (5cm cube, 8 pts), `physics:approximation = convexHull` **already set**, only `PhysicsCollisionAPI`/`PhysicsMeshCollisionAPI` — **no `RigidBodyAPI`/`MassAPI`** | Frozen as authored. Needs a rigid body + mass added; collision shape is already correct, no need to touch it |
+| `/World/SO_ARM101_USD` | world pos `(0, 0.3, 0.72)`, references `SO-ARM101-USD.usd`. Every link (`base`, `shoulder`, `upper_arm`, `lower_arm`, `wrist`, `gripper`, `jaw`) already has `PhysicsRigidBodyAPI`, `base` also has `PhysicsArticulationRootAPI` (see "All RigidBodyAPI prims" in the raw inspection log) | Reuse `SO101_CFG`, override `init_state.pos/rot` only. Nothing to add — a PhysX articulation *is* a chain of rigid-body links connected by joints, so this is required and already correctly authored |
+| `/World/AWSBuilderCube` | mesh `AWSBuilderCube_Geo`: extent ±0.025 (5cm cube, 8 pts), `physics:approximation = convexHull` **already set**, only `PhysicsCollisionAPI`/`PhysicsMeshCollisionAPI` — **no `RigidBodyAPI`/`MassAPI`** | Frozen as authored — the gripper would just collide with it like a wall, unable to lift it. Needs a *dynamic* rigid body + mass added (§3.2) so PhysX simulates the actual grasp via contact/friction forces, matching how the vial/rack task already works. (A *kinematic* rigid body was considered and rejected — it wouldn't respond to contact forces at all, requiring a scripted attach/detach on "grasp" instead of a real physical pickup.) Collision shape is already correct, no need to touch it |
 | `/World/AWSCubePaper` | sibling of `AWSBuilderCube` (not a child), world pos `(0, 0.03, 0.7504)` — coincident with the cube's bottom face | Paper label decal. Skip for v1 (see §3) |
-| `/World/PaperBowl` | mesh `Bowl_Geo`: extent `x:[-0.05,0.05] y:[-0.0375,0.0375] z:[0,0.032]` (**not circular** — 10cm×7.5cm, 3.2cm tall), `physics:approximation = none` (exact triangle mesh), no rigid body, world pos `(0.2, 0.03, 0.75)` | Leave static — matches the real fixed bowl position. Placement check must use a local-frame XY **box** bound sized to this extent, not a circular radius |
+| `/World/PaperBowl` | mesh `Bowl_Geo`: extent `x:[-0.05,0.05] y:[-0.0375,0.0375] z:[0,0.032]` (**not circular** — 10cm×7.5cm, 3.2cm tall), `physics:approximation = none` (exact triangle mesh), **no rigid body** | Stays static, no `RigidBodyAPI` at all — it's a fixed target the cube rests in and never needs to move, so plain collision geometry is sufficient (matches the real fixed bowl position). Placement check must use a local-frame XY **box** bound sized to this extent, not a circular radius |
 | Cameras | only `/World/SO_ARM101_USD/gripper/WristCamera` | No external/D455 camera in this scene, unlike the indoor-room task. Only matters once dataset recording is added (§4 stage 3) |
 | `demo/room-and-table-with-aws-cube.usd` | checked directly — it's a **strict subset** of `real-to-sim.usd` (room+tables+mount+cube, no robot/bowl/paper) | Not useful as a separate base; drop it from consideration entirely |
 
@@ -82,6 +144,26 @@ New module `tasks/aws_cube_to_bowl_env_cfg.py`, scene built off `LerobotSo101Bas
 (**not** `SO101TaskSceneCfg` — that one assumes the indoor-room/mat/lightstudio layout, a
 different physical setup than this two-table/RobotMount demo).
 
+### Measured latency — why cameras/sensors are staged, not just simplicity
+
+Two real, measured numbers (not estimates), both from this session:
+
+| | measured | source |
+|---|---|---|
+| Leader arm serial read (`SO101Leader.get_action()`, 200 samples, live hardware on COM4) | mean **1.06ms**, p50 1.02ms, p90 1.22ms, max 1.52ms (~945 Hz max poll rate) | throwaway `uv`-managed Python 3.12 venv + `lerobot-sim[feetech]`, read-only (`connect(calibrate=False)`, never writes to the servos) |
+| Sim `env.step()` on `Lerobot-So101-Teleop-Vials-To-Rack` (closest existing task — quality-mode RTX rendering, 2 cameras × rgb/depth/instance-seg, 60 samples) | mean **236ms**, p50 242ms, p90 312ms, max 401ms (~4.2 Hz implied control rate) | headless `isaaclab.app.AppLauncher` via `Y:\e\Scripts\python.exe`, same technique as §2/§6 |
+
+The leader-arm read is not the bottleneck — it's under 0.5% of total loop time. **The entire
+teleop loop's latency is the sim-side render/physics step**, and at ~236ms mean that's an
+effective ~4.2Hz control rate, which will feel noticeably laggy for live teleoperation (20-30Hz+
+is the usual target for a responsive feel). This is measured on the *existing* Vials-To-Rack
+task's camera/render config, not the new task, but it's the closest available proxy and the
+dominant cost (quality RTX + 2 cameras × 3 data types each = 6 render products) is exactly what
+stage 1 below deliberately avoids. If stage 2's camera turns out to reproduce this same ~200ms+
+per-step cost, it's worth reconsidering render mode (`"quality"` → `"performance"`) or trimming
+which camera data types are active during live teleop specifically (vs. dataset-recording runs,
+where slower-than-realtime stepping matters less).
+
 Build and test in stages — each stage runnable with `keyboard_agent.py` (no hardware) before
 moving to the next:
 
@@ -118,8 +200,30 @@ confirm-steps structure.
 ```
 python -m sim_to_real_so101.scripts.lerobot_agent \
     --task Lerobot-So101-Teleop-Aws-Cube-To-Bowl \
-    --port COM4 --robot_id armatron_leader
+    --port COM4 --robot_id my_so_arm
 ```
+
+### Calibration — correction
+
+The `--robot_id` above is `my_so_arm`, **not** `armatron_leader` as an earlier revision of
+this plan assumed (that name came from `lerobot-sim/CLAUDE.md`, which is stale/refers to a
+different setup). Checked [`calibration/`](../calibration) directly:
+- `calibration/robots/so_follower/my_so_arm.json` — follower calibration
+- `calibration/teleoperators/so_leader/my_so_arm.json` — leader calibration
+
+Both use the same id, `my_so_arm` — that's fine, not a collision, since lerobot namespaces
+calibration lookup by robot-type subfolder (`robots/so_follower/` vs `teleoperators/so_leader/`),
+confirmed by `HF_LEROBOT_CALIBRATION / "robots" / "so_follower" / f"{robot_id}.json"` in
+[`docker/real/scripts/so101_check_calibration.py:200`](../docker/real/scripts/so101_check_calibration.py).
+
+**One thing to confirm before running any teleop command**: `HF_LEROBOT_CALIBRATION`
+(env var) defaults to `~/.cache/huggingface/lerobot/calibration`
+([`lerobot/utils/constants.py:74-75`](../lerobot-sim/src/lerobot/utils/constants.py)), not
+this repo's `calibration/` folder — no script in this repo hardcodes pointing at the
+project-local one. Either set `HF_LEROBOT_CALIBRATION=<repo>/calibration` before running
+`lerobot_agent.py`, or pass `--robot.calibration_dir`/`--teleop.calibration_dir` explicitly
+(both `RobotConfig`/`TeleoperatorConfig` have a `calibration_dir: Path | None = None` field),
+or confirm the calibration files are already copied/symlinked into the default HF cache path.
 
 ## 5. Isaac Sim 6.0.1 constraint
 
