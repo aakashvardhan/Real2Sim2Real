@@ -123,64 +123,117 @@ python -m sim_to_real_so101.scripts.lerobot_agent \
 
 ## 5. Isaac Sim 6.0.1 constraint
 
-Researched via web search since 6.0.1 isn't installed on this machine (only 5.1 is, confirmed
-via `pip show isaacsim`) — this section is **not hands-on verified**, unlike §2's stage
-findings.
+Update: **Isaac Sim 6.0.1 is in fact installed locally** — `C:\Isaac-Sim` (`VERSION` file:
+`6.0.1-rc.7+release.42383.32955d8d.gl`), a full GUI-capable install accessible under this
+session's user account. There's also a second environment, `C:\ilab\e6`
+(`isaaclab==3.0.0b2.post1` + `isaacsim==6.0.1.0`, per `pip install` log
+`C:\ilab\install_isaaclab3.log`), with real validation logs already produced on 2026-08-13
+(`smoke_isaaclab3.log`, `list_envs_e6.log`, `zero_agent_e6.log`/`.err.log`) — but that venv
+was created under a **different Windows user profile** (`GUA-ADMIN`, per its
+`pyvenv.cfg` and the paths in its logs, e.g.
+`C:\Users\GUA-ADMIN\Desktop\Aakash\Sim-to-Real-SO-101-Workshop\...`), so this session
+(`OMNI-User`) gets `permission denied (os error 5)` trying to execute its Python directly —
+its logs are read-only evidence, not something this session can currently re-run. Worth
+confirming with the user whether that's a teammate's/setup script's environment they intend
+to keep using, or whether a fresh `OMNI-User`-owned Isaac Lab 3.0 venv should be created.
 
-**Isaac Sim 6.0.1 is paired with Isaac Lab 3.0 (currently Beta 2 - Patch 1)**, described by
-Isaac Lab's own release notes as introducing "a ground-up architectural overhaul" — a
-factory-based multi-backend physics architecture (PhysX / Newton / OVPhysX). There is no
-Isaac Lab 2.x release targeting Isaac Sim 6.0.1; the last pre-3.0 line tops out at Isaac Sim
-5.0 (with 4.5 backwards-compat). **This means moving to Isaac Sim 6.0.1 is a whole-repo
-concern, not something scoped to just this new task** — every existing file this task depends
-on (`so101_env_cfg.py`, `assets/so101.py`, `mdp/resets.py`, `mdp/terms.py`,
-`vials_to_rack_env_cfg.py`) currently targets Isaac Lab 2.x (paired with the locally-installed
-5.1) and needs to run correctly under 3.0 regardless of whether this new task exists.
+**Isaac Sim 6.0.1 pairs with Isaac Lab 3.0 (currently Beta 2 - Patch 1)**, described by Isaac
+Lab's own release notes as introducing "a ground-up architectural overhaul" — a factory-based
+multi-backend physics architecture (PhysX / Newton / OVPhysX). There is no Isaac Lab 2.x
+release targeting Isaac Sim 6.0.1. This is a whole-repo concern, not something scoped to just
+this new task — confirmed concretely below.
 
-**Why this is less scary than it sounds** — two mitigating facts:
+### What the existing `e6` validation logs already show
 
-1. Isaac Lab's own 3.0 release notes state: *"Your existing imports from `isaaclab.assets`
-   and `isaaclab.sensors` continue to work — the factory automatically dispatches to the
-   active backend at runtime."* The public config surface this plan relies on
-   (`ArticulationCfg`, `RigidObjectCfg`, `ContactSensorCfg`, `ManagerBasedRLEnvCfg`,
-   `EventTermCfg`/`ObservationTermCfg`/`TerminationTermCfg`, `gym.register`) is confirmed to
-   still exist and be the intended manager-based workflow in 3.0 (explicitly called out:
-   "memory leaks when closing manager-based... environments" fixed, "surface gripper... added
-   to manager-based workflow"). So the *shape* of this plan doesn't need to change.
-2. **This repo already has forward-compat infrastructure for exactly this transition.**
-   [`mdp/_compat.py`](../source/sim_to_real_so101/mdp/_compat.py)'s docstring says outright:
-   *"Isaac Lab 2.x returns torch.Tensor from `.data.*` properties; Isaac Lab 3.0 returns
-   warp.array instead. This keeps the mdp package working unmodified on either version."*
-   Every existing `.data.*` read in `mdp/resets.py`/`mdp/terms.py` is already wrapped in
-   `as_torch(...)` for exactly this reason. **This was already a known, partially-solved
-   problem in this codebase before this planning session — not something new.**
+- `smoke_isaaclab3.log`: basic Isaac Lab 3.0 functionality works — "stepped 10 sim steps OK,
+  device = cuda:0", "197 Isaac tasks registered in gym", "SMOKE: ALL OK".
+- `list_envs_e6.log`: running **this repo's own** `sim_to_real_so101.scripts.list_envs`
+  against Isaac Lab 3.0 / Isaac Sim 6.0.1 successfully lists all 6 currently-registered gym
+  tasks (`Lerobot-So101-Teleop-Base`, `-Task`, `-Vials-To-Rack`, `-Vials-To-Rack-DR`,
+  `-Vials-To-Rack-Eval`, `-Vials-To-Rack-DR-Eval`) — package import and gym registration
+  succeed end to end.
+- `zero_agent_e6.err.log`: **but actually running one of these tasks crashes**:
+  ```
+  File ".../source/sim_to_real_so101/tasks/task_env_cfg.py", line 26, in <module>
+      from isaacsim.core.utils.rotations import euler_angles_to_quat
+  ModuleNotFoundError: No module named 'isaacsim.core.utils'
+  ```
 
-**Concrete requirements for the new code in this plan:**
-- Every new `mdp/terms.py`/`mdp/resets.py` function (`cube_grasped`, `cube_placed_in_bowl`,
-  `cube_placed_in_bowl_termination`, `reset_aws_cube`) **must** wrap every `.data.*` read in
-  `as_torch(...)`, with zero exceptions — matching `any_vial_grasped`/`vial_placed_on_rack`
-  exactly. This was already the plan (copying those functions closely); treat it as a hard
-  requirement, not a style preference.
-- If/when stage 2 adds a camera, prefer `CameraCfg` over `TiledCameraCfg` for new code — 3.0
-  folds `TiledCamera` into `Camera` and says so explicitly ("existing tiled-camera aliases
-  remain as compatibility surface where available, but new code should use `Camera` and
-  `CameraCfg`"). The existing `camera_object` in `task_env_cfg.py` still uses `TiledCameraCfg`
-  and should keep working via the alias, but there's no reason for *new* code to take on that
-  deprecation.
-- Keep `ImplicitActuatorCfg` for the robot's actuators (what `SO101_CFG` already uses) rather
-  than reaching for anything from the new Newton-unified explicit-actuator path — implicit
-  PD-drive actuators are the simpler, lower-risk surface and nothing in the release notes
-  suggests they're going away.
+### Confirmed root cause and fix
 
-**Process recommendation — validate the foundation before building on it.** Before writing
-any of this new task, smoke-test the *existing*, unmodified
-`Lerobot-So101-Teleop-Vials-To-Rack` task against the actual Isaac Sim 6.0.1 / Isaac Lab 3.0
-environment the user will run on (once available — it's not installed on this machine).
-That task already exercises nearly every mechanism this plan needs: `ArticulationCfg`,
-`RigidObjectCfg` with `mass_props`/`rigid_props`, `ContactSensorCfg`, manager-based
-observations/events/terminations. If it doesn't come up cleanly on 6.0.1, the fixes belong in
-the shared base files, not in this task's new code — better to find that out first than to
-build on an unverified foundation.
+Checked this exact import against the locally-installed `C:\Isaac-Sim` 6.0.1 (via
+`isaacsim.SimulationApp`, same technique as §6): **`isaacsim.core.utils.rotations` imports
+fine there.** So this isn't "Isaac Sim 6.0.1 removed the old Core API" outright — it's
+launch-path-dependent (Isaac Lab 3.0's new "kit-less execution mode" is the likely
+differentiator: `list_envs.py` and the smoke test evidently loaded whatever extension provides
+`isaacsim.core.utils`, `zero_agent.py`'s launch path didn't). That makes it a landmine that
+may or may not trigger depending on exactly how the app is launched — not something safe to
+leave alone just because it happens to work in one invocation.
+
+Verified the replacement directly (`inspect.signature` + a live call, same technique):
+`isaacsim.core.experimental.utils.transform.euler_angles_to_quaternion` is the Core
+Experimental API equivalent — confirmed present, and numerically identical for the same input
+(`[0,0,90]` degrees → `(0.7071, 0, 0, 0.7071)` from both). Same semantics (`euler_angles`,
+`degrees`, `extrinsic` params; returns quaternion as **(w,x,y,z)**, matching the convention
+already recorded for `look_at_quaternion` in the same module — see
+[[isaac_sim_look_at_quaternion_order]]). Two call-site changes needed when migrating:
+- `degrees` becomes **keyword-only** (`def euler_angles_to_quaternion(euler_angles, *, degrees=False, ...)`) — positional calls like `euler_angles_to_quat(arr, True)` would break; every call site in this repo already uses `degrees=True` as a keyword, so this is a non-issue in practice, just worth knowing.
+- Return type is **`wp.array`, not `numpy.ndarray`** — call sites that hand the result straight
+  to `InitialStateCfg(rot=...)`/`AssetBaseCfg.InitialStateCfg(rot=...)` (a plain-array-like
+  field, not a live physics tensor) need `.numpy()` appended, e.g.
+  `euler_angles_to_quaternion(np.array([0,0,90]), degrees=True).numpy()`.
+
+**Exact call sites needing this migration** (grepped repo-wide for
+`from isaacsim.core` — all four use the old rotations import except the second):
+1. [`assets/so101.py:22`](../source/sim_to_real_so101/assets/so101.py) —
+   `from isaacsim.core.utils.rotations import euler_angles_to_quat`
+2. [`mdp/resets.py:28`](../source/sim_to_real_so101/mdp/resets.py) —
+   `from isaacsim.core.prims import XFormPrim` (different symbol/submodule; imported fine in
+   the same spot-check on `C:\Isaac-Sim`, but treat that as "not yet proven safe under the
+   `e6`/kit-less launch path either," precisely because we just demonstrated that "works in
+   one environment" didn't predict the `zero_agent_e6` failure)
+3. [`tasks/task_env_cfg.py:26`](../source/sim_to_real_so101/tasks/task_env_cfg.py) —
+   `from isaacsim.core.utils.rotations import euler_angles_to_quat`
+4. [`tasks/vials_to_rack_env_cfg.py:26`](../source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py) —
+   same import
+
+**This directly blocks the new task as planned, not just the existing ones.** §4's scene
+deliberately avoids `SO101TaskSceneCfg`/`task_env_cfg.py` to sidestep the indoor-room/mat
+layout mismatch — but it still imports `SO101_CFG`/`S0101_CONTACT_GRASP_CFG` from
+`assets/so101.py` (site #1 above), which is unavoidable (every task in this repo needs the
+robot config), and stage 2's `reset_aws_cube` would live in `mdp/resets.py` (site #2). **Fix
+site #1 (and, defensively, #2) before or alongside writing the new task** — this is a
+prerequisite, not an optional smoke-test-later item.
+
+### Other requirements for new code in this plan
+
+1. Every new `mdp/terms.py`/`mdp/resets.py` function (`cube_grasped`, `cube_placed_in_bowl`,
+   `cube_placed_in_bowl_termination`, `reset_aws_cube`) **must** wrap every `.data.*` read in
+   `as_torch(...)`, matching `any_vial_grasped`/`vial_placed_on_rack` exactly.
+   [`mdp/_compat.py`](../source/sim_to_real_so101/mdp/_compat.py)'s docstring confirms exactly
+   why: *"Isaac Lab 2.x returns torch.Tensor from `.data.*` properties; Isaac Lab 3.0 returns
+   warp.array instead."* This was already a known, partially-solved problem in this codebase
+   before this planning session.
+2. If/when stage 2 adds a camera, prefer `CameraCfg` over `TiledCameraCfg` — 3.0 folds
+   `TiledCamera` into `Camera` ("existing tiled-camera aliases remain as compatibility surface
+   where available, but new code should use `Camera` and `CameraCfg`"). The existing
+   `camera_object` in `task_env_cfg.py` still uses `TiledCameraCfg` and should keep working
+   via the alias; no reason for *new* code to take on that deprecation.
+3. Keep `ImplicitActuatorCfg` for the robot's actuators (what `SO101_CFG` already uses) —
+   implicit PD-drive actuators are the simpler, lower-risk surface; nothing suggests they're
+   going away, unlike the explicit/Newton-unified actuator path.
+
+### Process recommendation
+
+Fix the 4 known import sites (§5 above) first, confirming each against whichever concrete
+Isaac Sim 6.0.1 / Isaac Lab 3.0 Python environment the user settles on (either get access
+sorted out for the existing `e6` venv, or stand up an `OMNI-User`-owned one) — then re-run
+`zero_agent.py`/`list_envs.py` against the **existing**, unmodified
+`Lerobot-So101-Teleop-Vials-To-Rack` task to confirm it actually steps physics end to end
+(not just imports/registers) before writing any of this plan's new task code. That task
+already exercises nearly every mechanism this plan needs: `ArticulationCfg`, `RigidObjectCfg`
+with `mass_props`/`rigid_props`, `ContactSensorCfg`, manager-based
+observations/events/terminations.
 
 ## 6. Isaac Sim inspection technique (gotcha)
 
