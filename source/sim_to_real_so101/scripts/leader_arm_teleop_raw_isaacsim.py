@@ -91,6 +91,7 @@ from pxr import Gf, UsdPhysics  # noqa: E402
 
 from sim_to_real_so101.utils.keyboard import KeyboardControl  # noqa: E402
 from sim_to_real_so101.utils.lerobot_interface import LeRobotSO101Interface  # noqa: E402
+from sim_to_real_so101.utils.physics_material import apply_friction_material  # noqa: E402
 from sim_to_real_so101.utils.scene_reset import restore_prim_pose, snapshot_xform_ops  # noqa: E402
 from sim_to_real_so101.utils.version_banner import print_simulator_version_banner  # noqa: E402
 
@@ -102,7 +103,28 @@ REAL_TO_SIM_USD = os.path.join(_DEMO_DIR, "real-to-sim.usd")
 ROBOT_PRIM_PATH = "/World/SO_ARM101_USD"
 AWS_CUBE_PRIM_PATH = "/World/AWSBuilderCube"
 AWS_CUBE_MASS_KG = 0.05
+# See keyboard_agent_raw_isaacsim.py's identical constant -- friction is a
+# collision-shape property (PhysicsMaterialAPI), not a rigid-body property.
+AWS_CUBE_COLLISION_MESH_PATH = "/World/AWSBuilderCube/Geometry/AWSBuilderCube_Geo"
 PAPER_BOWL_PRIM_PATH = "/World/PaperBowl"
+
+# See keyboard_agent_raw_isaacsim.py -- gripper pad collision shapes.
+GRIPPER_COLLISION_PATH = "/World/SO_ARM101_USD/gripper/collisions"
+JAW_COLLISION_PATH = "/World/SO_ARM101_USD/jaw/collisions"
+
+# See keyboard_agent_raw_isaacsim.py -- rigid PVC-like friction for the cube,
+# chosen over PP (more slippery) since the goal is to stop the cube slipping
+# out of the gripper. Neither cube nor gripper had any physics material
+# before this.
+AWS_CUBE_STATIC_FRICTION = 0.5
+AWS_CUBE_DYNAMIC_FRICTION = 0.45
+AWS_CUBE_RESTITUTION = 0.0
+
+# See keyboard_agent_raw_isaacsim.py -- rubber/silicone-like friction for the
+# gripper pads, higher than the cube's.
+GRIPPER_STATIC_FRICTION = 0.9
+GRIPPER_DYNAMIC_FRICTION = 0.8
+GRIPPER_RESTITUTION = 0.0
 
 # Exact xformOp:translate / xformOp:orient authored on /World/SO_ARM101_USD
 # in real-to-sim.usd -- see keyboard_agent_raw_isaacsim.py's identical
@@ -145,6 +167,21 @@ def main():
         UsdPhysics.RigidBodyAPI.Apply(cube_prim)
     if not cube_prim.HasAPI(UsdPhysics.MassAPI):
         UsdPhysics.MassAPI.Apply(cube_prim).CreateMassAttr(AWS_CUBE_MASS_KG)
+
+    cube_collision_mesh = stage.GetPrimAtPath(AWS_CUBE_COLLISION_MESH_PATH)
+    if not cube_collision_mesh.IsValid():
+        raise RuntimeError(f"Expected prim not found: {AWS_CUBE_COLLISION_MESH_PATH}")
+    apply_friction_material(
+        cube_collision_mesh, AWS_CUBE_STATIC_FRICTION, AWS_CUBE_DYNAMIC_FRICTION, AWS_CUBE_RESTITUTION
+    )
+
+    for collision_path in (GRIPPER_COLLISION_PATH, JAW_COLLISION_PATH):
+        collision_prim = stage.GetPrimAtPath(collision_path)
+        if not collision_prim.IsValid():
+            raise RuntimeError(f"Expected prim not found: {collision_path}")
+        apply_friction_material(
+            collision_prim, GRIPPER_STATIC_FRICTION, GRIPPER_DYNAMIC_FRICTION, GRIPPER_RESTITUTION
+        )
 
     bowl_prim = stage.GetPrimAtPath(PAPER_BOWL_PRIM_PATH)
     if not bowl_prim.IsValid():
