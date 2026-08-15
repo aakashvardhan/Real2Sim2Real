@@ -25,9 +25,8 @@ import isaaclab.utils.math as math_utils
 from isaaclab.sim import get_current_stage
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.assets import Articulation, RigidObject
-from isaacsim.core.prims import XFormPrim
-
 from ._compat import as_torch
+from sim_to_real_so101.utils.xform_prim_compat import make_xform_prim
 
 
 
@@ -81,7 +80,7 @@ def randomize_mat_rotation(
     
     orientations = math_utils.quat_from_euler_xyz(roll, pitch, base_yaw + yaw)
     
-    asset_xform = XFormPrim(prim_paths_expr=asset_prim_path)
+    asset_xform = make_xform_prim(asset_prim_path)
     
     with Sdf.ChangeBlock():
         asset_xform.set_local_poses(orientations=orientations)
@@ -270,7 +269,7 @@ def randomize_sky_light(
         rand_samples[:, 0], rand_samples[:, 1], rand_samples[:, 2]
     )
 
-    asset_xform = XFormPrim(prim_paths_expr=asset_prim_path)
+    asset_xform = make_xform_prim(asset_prim_path)
 
     with Sdf.ChangeBlock():
         asset_xform.set_local_poses(orientations=orientations)
@@ -333,7 +332,7 @@ def reset_vials_rack(
     ]
 
     rack = env.scene[rack]
-    slots_xform_view = XFormPrim(prim_paths_expr=f"{rack.cfg.prim_path}/Body1/Mesh/top_*")
+    slots_xform_view = make_xform_prim(f"{rack.cfg.prim_path}/Body1/Mesh/top_*")
     total_slots = len(slots_xform_view.prims)
 
     # randomize rack pose
@@ -383,3 +382,20 @@ def reset_vials_rack(
             _, _ = random_asset_pose(env, env_ids, v, pose_range_z_fixed, pos_offset)
             zero_velocity = torch.zeros((len(env_ids), 6), device=v.device)
             v.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)
+
+
+def reset_aws_cube(
+        env,
+        env_ids: torch.Tensor,
+        aws_cube: str,
+        pose_range: dict[str, tuple[float, float]],
+):
+    """Randomize the AWSBuilderCube's pose on reset.
+
+    Simplified single-object version of reset_vials_rack -- no rack-slot
+    placement logic since there is exactly one cube and no pre-placed state.
+    """
+    cube = env.scene[aws_cube]
+    _, _ = random_asset_pose(env, env_ids, cube, pose_range, {})
+    zero_velocity = torch.zeros((len(env_ids), 6), device=cube.device)
+    cube.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)

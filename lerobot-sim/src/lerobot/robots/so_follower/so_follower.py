@@ -295,3 +295,12 @@ class SO101Follower(SOFollower):
             "Open and close the gripper fully.\n"
             "Recording positions. Press ENTER to stop..."
         )
+
+
+# Back-compat aliases: same naming-convention mismatch as so_leader.py's
+# SO101LeaderTeleop/SO100LeaderTeleop aliases -- config_so_follower.py's
+# SO101FollowerConfig/SO100FollowerConfig are aliased to the *RobotConfig classes, so
+# make_device_from_device_class's naming lookup searches this module for
+# "SO101FollowerRobot"/"SO100FollowerRobot", not "SO101Follower"/"SO100Follower".
+SO101FollowerRobot = SO101Follower
+SO100FollowerRobot = SO100Follower

@@ -108,6 +108,9 @@ from isaaclab_tasks.utils import parse_env_cfg
 import sim_to_real_so101.tasks  # noqa: F401
 from sim_to_real_so101.tasks.task_env_cfg import apply_rtx_translucency_settings
 from sim_to_real_so101.utils.keyboard import JointJogKeyboardControl
+from sim_to_real_so101.utils.version_banner import print_simulator_version_banner
+
+print_simulator_version_banner()
 
 # LeRobotSO101Interface/LeRobotRecorder both import the `lerobot` pip package,
 # which isn't installed by this repo's Isaac Lab pip install (only pulled in
@@ -137,6 +140,7 @@ def main():
     # print info (this is vectorized environment)
     print(f"[INFO]: Gym observation space: {env.observation_space}")
     print(f"[INFO]: Gym action space: {env.action_space}")
+    print_simulator_version_banner()
     print(f"[INFO]: Keyboard jog controls (hold to move, release to stop):")
     for joint in JointJogKeyboardControl.JOINT_ORDER:
         pos_key, neg_key = JointJogKeyboardControl.JOINT_KEYS[joint]

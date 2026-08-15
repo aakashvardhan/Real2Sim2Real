@@ -203,3 +203,13 @@ class SO101Leader(SOLeader):
             "Open and close the gripper/trigger fully.\n"
             "Recording positions. Press ENTER to stop..."
         )
+
+
+# Back-compat aliases: config_so_leader.py's SO101LeaderConfig/SO100LeaderConfig are
+# aliased to the *TeleopConfig classes (SO101LeaderTeleopConfig/SO100LeaderTeleopConfig),
+# so lerobot.utils.import_utils.make_device_from_device_class's naming-convention lookup
+# (strips "Config" off the config class's own __name__) searches this module for
+# "SO101LeaderTeleop"/"SO100LeaderTeleop", not "SO101Leader"/"SO100Leader" -- without
+# these aliases, make_robot_from_config(SO101LeaderConfig(...)) raises ImportError.
+SO101LeaderTeleop = SO101Leader
+SO100LeaderTeleop = SO100Leader

@@ -1,361 +1,274 @@
-# Real-to-Sim Teleop Plan: AWSBuilderCube → PaperBowl
+# Real-to-Sim Teleop: AWSBuilderCube → PaperBowl (Isaac Sim 6.0.1, raw — no Isaac Lab)
 
-**Goal:** teleoperate the real SO-101 leader arm (COM4) to drive `SO_ARM101_USD` inside
+**Goal:** teleoperate `SO_ARM101_USD` inside
 [`source/sim_to_real_so101/demo/real-to-sim.usd`](../source/sim_to_real_so101/demo/real-to-sim.usd)
 for a pick-and-place task — place `AWSBuilderCube` into `PaperBowl`.
 
-**Target platform constraint: Isaac Sim 6.0.1.** The machine this plan was researched on has
-Isaac Sim **5.1.0.0** installed (`Y:\e` venv, `pip show isaacsim` → `5.1.0.0`), not 6.0.1. See
-[Isaac Sim 6.0.1 constraint](#isaac-sim-601-constraint) before implementing — it changes the
-risk profile for the whole repo, not just this task.
+**Hard platform constraint: Isaac Sim 6.0.1, Isaac Lab off-limits entirely (any version,
+including 3.0).** This is not a preference — it ruled out the normal path for this repo. Every
+other script here (`keyboard_agent.py`, `lerobot_agent.py`, `zero_agent.py`, etc.) is built on
+`isaaclab.app.AppLauncher` / `isaaclab.envs.ManagerBasedRLEnv`, and the *only* Isaac Lab release
+that supports Isaac Sim 6.0.1 is Isaac Lab 3.0 (Beta) — there is no Isaac-Lab-based way to
+satisfy "Isaac Sim 6.0.1, no Isaac Lab." So this task is implemented against Isaac Sim's own
+APIs directly: `isaacsim.SimulationApp` (not `AppLauncher`), raw PhysX `PhysicsDriveAPI`
+attributes on each joint (not `ArticulationCfg`/`ImplicitActuatorCfg`), no gym env.
 
-Status: **planning only, not yet implemented.**
+**Status: implemented and verified working.** Keyboard-jog joint control confirmed on
+`C:\Isaac-Sim` (a completely clean 6.0.1 install — `pip list` shows nothing named
+isaacsim/isaaclab, confirming no Isaac Lab presence at all). Robot renders in the correct
+position, all 6 joints jog correctly, and the gripper has confirmed real grasp torque against
+the cube.
+
+**Not yet done** (see §5): real leader-arm (COM4) hardware input — only keyboard jogging exists
+today, chosen deliberately as the minimal first slice. Also no grasp/placement *detection*
+(the robot can physically pick up and place the cube, but nothing watches for it), no dataset
+recording.
 
 ---
 
-## 0. Workflow diagram
+## 0. Architecture
 
-The mechanism this plan hinges on: the real leader arm's raw joint angles have to cross a
-unit boundary (degrees, real motor range → radians, sim joint range) before they can drive
-the articulation, and the actual pick-and-place is a physical contact chain (jaw → cube →
-bowl), not a scripted move. Dataset recording is a one-way tap off the loop, not part of it.
+No gym env, no `env.step()` — this is a plain Kit/PhysX loop: read held keys, accumulate a
+per-joint target in degrees, clamp to the joint's own authored limits, write it straight to
+each joint's `drive:angular:physics:targetPosition` USD attribute every frame.
 
 ```mermaid
 flowchart LR
-    subgraph PHYS["Physical world"]
-        LEADER["SO-101 leader arm<br/>COM4, serial"]
+    subgraph KB["Keyboard (implemented today)"]
+        KEYS["held keys<br/>D/A W/X E/V T/G Y/H U/J"]
     end
-
-    subgraph HOST["lerobot_agent.py — every control tick"]
-        CONV["unit conversion<br/>deg + real joint range<br/>&#8594; rad + sim joint range"]
+    subgraph HOST["keyboard_agent_raw_isaacsim.py -- every simulation_app.update()"]
+        JOG["JointJogKeyboardControl<br/>held key -> per-joint delta, degrees"]
+        TARGETS["running target[6]<br/>clamped to each joint's own<br/>physics:lowerLimit/upperLimit"]
     end
-
-    subgraph SIMENV["Isaac Sim env: Aws-Cube-To-Bowl"]
-        JOINTS["6 joint drives<br/>Rotation ... Jaw"]
+    subgraph SIM["Isaac Sim 6.0.1 -- real-to-sim.usd, physics playing"]
+        JOINTS["6 PhysicsDriveAPI joints<br/>Rotation ... Jaw (degrees)"]
         GRIP["gripper / jaw"]
-        CUBE["AWSBuilderCube<br/>dynamic rigid body"]
-        BOWL["PaperBowl<br/>static"]
+        CUBE["AWSBuilderCube<br/>RigidBodyAPI+MassAPI added at runtime"]
+        BOWL["PaperBowl (static, untouched)"]
     end
 
-    REC["LeRobotRecorder"]
-    DISK[("dataset on disk")]
-
-    LEADER -- "raw joint angles (deg)" --> CONV
-    CONV -- "env.step(action), rad" --> JOINTS
-    JOINTS -- "drives" --> GRIP
-    GRIP -- "contact / friction" --> CUBE
+    KEYS --> JOG --> TARGETS -- "targetPosition attr, deg" --> JOINTS
+    JOINTS -- drives --> GRIP -- "contact / friction" --> CUBE
     CUBE -. "released, resting in" .-> BOWL
-    JOINTS -- "obs: joint_pos, ee_frame" --> CONV
-    CONV -. "only if --repo_id set" .-> REC
-    REC --> DISK
 ```
 
-`CONV` is `LeRobotSO101Interface.real_to_sim_obs_processor()` /
-`get_mapped_actions_vectorized()` in
-[`utils/lerobot_interface.py`](../source/sim_to_real_so101/utils/lerobot_interface.py); the
-whole left-to-right pass through `CONV` → `JOINTS` → obs-return repeats every control tick for
-as long as `lerobot_agent.py` runs. The `GRIP`→`CUBE`→`BOWL` chain only exists once §3/§4's
-rigid-body work (`AWSBuilderCube.usda`) is in place — today the cube is frozen geometry, so
-that segment of the diagram is the part this plan actually has to build.
+A future leader-arm version would replace the `KB` subgraph with a serial read + degree
+conversion (`lerobot_interface.py`'s conversion math is framework-agnostic — see §5), feeding
+the *same* `TARGETS` mechanism. Nothing downstream of `TARGETS` would need to change.
 
-**No ROS2 anywhere in this diagram — deliberately, not by oversight.** There's a separate
-ROS2 pathway in this repo's dependency tree: `lerobot-ros-teleoperate`
-(`lerobot-sim/src/lerobot/scripts/lerobot_ros_teleoperate.py`, a real registered entry point —
-see `lerobot-sim/pyproject.toml:311`) publishes joint states to a `/joint_states` ROS2 topic
-every cycle; a `ros2 run topic_tools relay /joint_states /isaac_joint_command` node bridges
-that into Isaac Sim, opened directly in the GUI with a ROS2 OmniGraph subscriber already wired
-into the scene (documented in `lerobot-sim/SO-ARM101-ISAAC-SIM-GUIDE.md` and
-`lerobot-sim/PROTOMOTA_README.md` — also where the `armatron`/`armatron_leader` example IDs in
-`lerobot-sim/CLAUDE.md` come from, a different context than this repo's own `my_so_arm`
-calibration files). It's real and runnable, but it's pure joint-mirroring visualization — no
-gym env, no contact sensors, no rigid-body task objects, no reward/termination — it can't run
-a physics-driven pick-and-place task at all. Confirmed zero references to it anywhere in
-`source/sim_to_real_so101/`, `docker/`, or this project's own docs; it's inherited from the
-vendored `lerobot` fork's broader feature set, not wired into this project's actual pipeline.
-This plan's diagram reflects `lerobot_agent.py`'s real mechanism: direct Python calls
-(`env.step()`), no message broker.
+## 1. What exists
 
-## 1. What already exists — don't rebuild it
+- [`scripts/keyboard_agent_raw_isaacsim.py`](../source/sim_to_real_so101/scripts/keyboard_agent_raw_isaacsim.py)
+  — the whole implementation, self-contained, no Isaac Lab import anywhere.
+- [`utils/keyboard.py`](../source/sim_to_real_so101/utils/keyboard.py)'s `JointJogKeyboardControl`
+  — reused unmodified. Built directly on `carb.input`/`omni.appwindow`/`omni.kit.app`, zero
+  Isaac Lab dependency, so it works as-is here even though it was originally written for the
+  Isaac-Lab-based `keyboard_agent.py`.
+- [`utils/version_banner.py`](../source/sim_to_real_so101/utils/version_banner.py)'s
+  `print_simulator_version_banner()` — prints the real Isaac Sim version (from a `VERSION`-file
+  fallback, since a plain Kit-app install like `C:\Isaac-Sim` has no `importlib.metadata` entry
+  for `isaacsim`) plus an explicit "no Isaac Lab installed" line when applicable. Printed twice
+  (right after boot, and again right before the controls list) so it's unmissable in a demo.
 
-- [`scripts/lerobot_agent.py`](../source/sim_to_real_so101/scripts/lerobot_agent.py) +
-  [`utils/lerobot_interface.py`](../source/sim_to_real_so101/utils/lerobot_interface.py)'s
-  `LeRobotSO101Interface(kind="leader", port=..., id=...)` already implement "real leader arm
-  drives an Isaac Lab task" end to end — connect, read `robot.get_action()`, map to sim
-  joint-radian space, `env.step()`, optional `--repo_id/--repo_root/--task_name` dataset
-  recording. **No new teleop script needed.** The only missing piece is a gym-registered task
-  config for this scene.
-- The robot referenced by `real-to-sim.usd` (`/World/SO_ARM101_USD` →
-  `../assets/usd/SO-ARM101-USD.usd`) is the **exact same file** already wired up as
-  `SO101_CFG` in [`assets/so101.py`](../source/sim_to_real_so101/assets/so101.py), with joint
-  names (`Rotation, Pitch, Elbow, Wrist_Pitch, Wrist_Roll, Jaw`) matching `ActionsCfg` in
-  [`tasks/so101_env_cfg.py`](../source/sim_to_real_so101/tasks/so101_env_cfg.py) exactly. No
-  new robot articulation config needed.
+## 2. How to run it
 
-## 2. Facts verified by inspecting the stage directly
+```powershell
+C:\Isaac-Sim\python.bat source\sim_to_real_so101\scripts\keyboard_agent_raw_isaacsim.py
+```
 
-Raw pxr isn't importable via plain `python.bat`; verified instead with a headless
-`isaaclab.app.AppLauncher` script run through `Y:\e\Scripts\python.exe` (the venv this repo's
-own scripts document running with), traversing the stage with `Usd.Stage.Open()`. See
-[Isaac Sim inspection technique](#isaac-sim-inspection-technique-gotcha) for the buffering
-gotcha hit while doing this.
+Direct file path, **not** `-m` — this repo's package isn't pip-installed in a plain Isaac Sim
+python (only the Isaac-Lab venvs have it via `pip install -e`), so `-m package.module`
+resolution fails before the script's own `sys.path` insertion ever runs. Confirmed directly:
+`-m` gives `ModuleNotFoundError: No module named 'sim_to_real_so101'`; the direct file path
+works.
 
-| Prim | State | Implication |
+Add `--headless` for no viewport window, `--joint_step <degrees>` to change jog speed
+(default `0.5°` per `simulation_app.update()` tick while a key is held).
+
+Expect roughly 30-45s to boot to the ready state (`[INFO]: Keyboard jog controls...` printed) —
+first extension/shader loading. Controls:
+
+| Joint | Increase (+) | Decrease (−) |
 |---|---|---|
-| `/World/SO_ARM101_USD` | world pos `(0, 0.3, 0.72)`, references `SO-ARM101-USD.usd`. Every link (`base`, `shoulder`, `upper_arm`, `lower_arm`, `wrist`, `gripper`, `jaw`) already has `PhysicsRigidBodyAPI`, `base` also has `PhysicsArticulationRootAPI` (see "All RigidBodyAPI prims" in the raw inspection log) | Reuse `SO101_CFG`, override `init_state.pos/rot` only. Nothing to add — a PhysX articulation *is* a chain of rigid-body links connected by joints, so this is required and already correctly authored |
-| `/World/AWSBuilderCube` | mesh `AWSBuilderCube_Geo`: extent ±0.025 (5cm cube, 8 pts), `physics:approximation = convexHull` **already set**, only `PhysicsCollisionAPI`/`PhysicsMeshCollisionAPI` — **no `RigidBodyAPI`/`MassAPI`** | Frozen as authored — the gripper would just collide with it like a wall, unable to lift it. Needs a *dynamic* rigid body + mass added (§3.2) so PhysX simulates the actual grasp via contact/friction forces, matching how the vial/rack task already works. (A *kinematic* rigid body was considered and rejected — it wouldn't respond to contact forces at all, requiring a scripted attach/detach on "grasp" instead of a real physical pickup.) Collision shape is already correct, no need to touch it |
-| `/World/AWSCubePaper` | sibling of `AWSBuilderCube` (not a child), world pos `(0, 0.03, 0.7504)` — coincident with the cube's bottom face | Paper label decal. Skip for v1 (see §3) |
-| `/World/PaperBowl` | mesh `Bowl_Geo`: extent `x:[-0.05,0.05] y:[-0.0375,0.0375] z:[0,0.032]` (**not circular** — 10cm×7.5cm, 3.2cm tall), `physics:approximation = none` (exact triangle mesh), **no rigid body** | Stays static, no `RigidBodyAPI` at all — it's a fixed target the cube rests in and never needs to move, so plain collision geometry is sufficient (matches the real fixed bowl position). Placement check must use a local-frame XY **box** bound sized to this extent, not a circular radius |
-| Cameras | only `/World/SO_ARM101_USD/gripper/WristCamera` | No external/D455 camera in this scene, unlike the indoor-room task. Only matters once dataset recording is added (§4 stage 3) |
-| `demo/room-and-table-with-aws-cube.usd` | checked directly — it's a **strict subset** of `real-to-sim.usd` (room+tables+mount+cube, no robot/bowl/paper) | Not useful as a separate base; drop it from consideration entirely |
+| Rotation (base yaw) | `D` | `A` |
+| Pitch (shoulder) | `W` | `X` |
+| Elbow | `E` | `V` |
+| Wrist_Pitch | `T` | `G` |
+| Wrist_Roll | `Y` | `H` |
+| Jaw (gripper) | `U` | `J` |
 
-## 3. Asset strategy — thin reference wrappers, not full extraction
+`R` resets all 6 joint targets to 0°. Click into the viewport first — it needs focus to receive
+key events. If the robot isn't visible on first launch, select `SO_ARM101_USD` in the Stage
+outliner and press `F` to frame it.
 
-USD references can target a *specific prim path* inside another layer
-(`references = @real-to-sim.usd@</World/AWSBuilderCube>`), not just a whole file's
-defaultPrim. This avoids hand-flattening/duplicating any geometry or materials — two small
-new files under `assets/usd/` are enough:
+## 3. Facts verified directly against `real-to-sim.usd`
 
-1. **`aws-cube-bowl-room.usda`** — references `real-to-sim.usd`'s `/World`, with `over`
-   blocks setting:
-   - `/World/SO_ARM101_USD.active = false` (we spawn our own `SO101_CFG` copy separately —
-     leaving this active would double-spawn a robot on top of it)
-   - `/World/AWSBuilderCube.active = false` (we spawn a separate dynamic rigid-body copy —
-     same double-spawn concern)
-   - `PaperBowl` and everything else (walls, tables, mount, lights) stay active, untouched.
-     **No separate bowl asset needed** — read its pose at runtime via
-     `sim_utils.find_matching_prims()` off the room's resolved prim path, exactly like
-     `randomize_mat_rotation`/`randomize_camera_pose` in
-     [`mdp/resets.py`](../source/sim_to_real_so101/mdp/resets.py) already do for other static
-     nested prims.
-2. **`AWSBuilderCube.usda`** — references just `real-to-sim.usd</World/AWSBuilderCube>` as
-   its defaultPrim, nothing else authored in the file. `RigidObjectCfg.spawn.rigid_props` /
-   `.mass_props` in Python add `RigidBodyAPI`/`MassAPI` at spawn time — the same mechanism
-   already used for `Vial_opaque.usda` in
-   [`tasks/vials_to_rack_env_cfg.py`](../source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py).
-   No physics schemas need to be hand-authored inside the wrapper.
-3. **Skip `AWSCubePaper`** (the label decal) for v1. Its position is coincident with the
-   cube's bottom face; reparenting it correctly means solving a local-offset problem for a
-   purely cosmetic sticker — not worth it before the functional task works. A plain textured
-   cube with no sticker is not a blocker.
+Verified with `isaacsim.SimulationApp` (headless) and, separately, with a throwaway `usd-core`
+pip venv (`usdenv/Scripts/python.exe`, no Kit boot needed for pure `pxr` inspection — see §6).
 
-## 4. Task config — staged, mirroring `vials_to_rack_env_cfg.py`
+| Prim | State |
+|---|---|
+| `/World/SO_ARM101_USD` | `xformOp:translate = (0, 0.3, 0.72)`, `xformOp:orient = (1,0,0,0)` (identity), `xformOp:scale = (1,1,1)`. Every link already has `PhysicsRigidBodyAPI`; `base` also has `PhysicsArticulationRootAPI`. |
+| `/World/SO_ARM101_USD/root_joint` | `PhysicsFixedJoint`, `body0` empty (binds to the physics scene's literal origin, not the ancestor Xform), `body1 = .../base`. `localPos0=(0,0,0)`, `localRot0=(1,0,0,0)` (identity), `localPos1=(0,0,0)`, `localRot1=(0.7071,0,0,-0.7071)`. **Authored assuming the robot's ancestor Xform sits at the origin — it doesn't (see above). Must be corrected at runtime, see §4.1.** |
+| `/World/SO_ARM101_USD/joints/{Rotation,Pitch,Elbow,Wrist_Pitch,Wrist_Roll,Jaw}` | Each a `PhysicsRevoluteJoint` with `PhysicsDriveAPI:angular` applied. `drive:angular:physics:targetPosition/stiffness/damping/maxForce` all present; `type=force`. Raw file's default gains, **uniform across all 6 joints**: `stiffness=17.8, damping=0.6, maxForce=10`. `physics:lowerLimit`/`upperLimit` authored in **degrees** (e.g. Rotation `±110°`, matching `SO101_CFG`'s `±1.920 rad` in the (unused, Isaac-Lab-only) config exactly via `rad × 180/π`). |
+| `/World/AWSBuilderCube` | `xformOp:translate = (0, 0.03, 0.7754)` — the cube's own center. (Not `/World/AWSCubePaper`'s position, `(0, 0.03, 0.7504)` — that sibling decal sits at the cube's *bottom face*, 2.5cm lower; conflating the two was an early mistake, corrected.) Mesh `AWSBuilderCube_Geo` under `AWSBuilderCube/Geometry/`, `physics:approximation=convexHull`, has `PhysicsCollisionAPI`/`PhysicsMeshCollisionAPI` — but **no `RigidBodyAPI`/`MassAPI`** authored. Without adding these it behaves like a static wall under gripper contact. |
+| `/World/PaperBowl` | Mesh `Bowl_Geo`, extent `x:[-0.05,0.05] y:[-0.0375,0.0375] z:[0,0.032]` (**not circular** — 10cm×7.5cm, 3.2cm tall), `physics:approximation=none` (exact triangle mesh), no rigid body — stays static, untouched. |
+| `/World/Table`, `/World/Table_02` | Table tops at world `z=0.75`. Cube/bowl both rest directly on top (cube bottom face at `z=0.7504`, matches). |
 
-New module `tasks/aws_cube_to_bowl_env_cfg.py`, scene built off `LerobotSo101BaseSceneCfg`
-(**not** `SO101TaskSceneCfg` — that one assumes the indoor-room/mat/lightstudio layout, a
-different physical setup than this two-table/RobotMount demo).
+## 4. Bugs found and fixed (all confirmed empirically, not just reasoned about)
 
-### Measured latency — why cameras/sensors are staged, not just simplicity
+### 4.1 Robot spawned in the wrong place / invisible
 
-Two real, measured numbers (not estimates), both from this session:
+**Symptom:** robot didn't render where expected; Kit logged
+`PhysicsUSD: CreateJoint - found a joint with disjointed body transforms, the simulation will
+most likely snap objects together: /World/SO_ARM101_USD/root_joint`.
 
-| | measured | source |
+**Root cause:** `root_joint`'s `body0` is empty, which in USD Physics means it binds to the
+physics scene's literal origin `(0,0,0)` — **not** the `/World/SO_ARM101_USD` ancestor Xform's
+actual position. The joint's `localPos0`/`localRot0` (world side) were left at identity, but
+`localRot1` (robot side) has a real 90°-ish rotation baked in — i.e. the joint was authored
+assuming the robot's ancestor Xform would sit at the origin. It doesn't (translated to
+`(0, 0.3, 0.72)`), so PhysX tried to satisfy the constraint at the origin instead, snapping the
+whole robot away from the table.
+
+**Fix:** at runtime, right after opening the stage and before `timeline.play()`:
+```python
+local_rot1 = root_joint_prim.GetAttribute("physics:localRot1").Get()
+root_joint_prim.GetAttribute("physics:localPos0").Set(ROBOT_POS)       # (0, 0.3, 0.72)
+root_joint_prim.GetAttribute("physics:localRot0").Set(local_rot1)      # reuse, don't reinvent
+```
+This is exact, not approximate, because `localPos1=(0,0,0)` and the ancestor Xform's own
+orientation is identity — so the compensating `localPos0`/`localRot0` is just `ROBOT_POS` and
+the joint's own existing `localRot1`.
+
+**Verified:** a standalone test opened the stage, applied the fix, ran 60 physics steps, and
+read `base`'s actual world position back via `UsdGeom.Xformable.ComputeLocalToWorldTransform()`:
+result `(-0.0000014, 0.30017, 0.72009)` — within 0.2mm of the expected `(0, 0.3, 0.72)`. The
+"disjointed body transforms" warning no longer appears.
+
+### 4.2 Gripper couldn't grasp anything
+
+**Symptom:** robot moved correctly, but the jaw couldn't actually grip/lift the cube.
+
+**Root cause:** an *incorrect* unit conversion. `SO101_CFG`'s actuator gains
+(`assets/so101.py`, values like `Jaw: stiffness=4, damping=0.3`) are Isaac-Lab-era numbers,
+tuned for a radian-space representation. The raw joint's `PhysicsDriveAPI` position values
+(`targetPosition`, `lowerLimit`, `upperLimit`) are authored in **degrees**. The first version of
+this script "corrected" for that by scaling stiffness/damping by `π/180 ≈ 0.01745` — reasoning
+that the drive gain must operate directly against the degree-valued position error. That
+reasoning was wrong: it made every joint roughly 57× weaker than intended (e.g. Jaw's
+`stiffness` became `~0.07`), nowhere near enough torque to hold anything against resistance.
+
+**Verified empirically**, not just reasoned about a second time: a live A/B/C step-response
+test drove the Jaw joint to a 60° target under three gain settings and read back the actual
+settled position after 90 physics steps:
+
+| Trial | stiffness / damping | final position (target 60°) |
 |---|---|---|
-| Leader arm serial read (`SO101Leader.get_action()`, 200 samples, live hardware on COM4) | mean **1.06ms**, p50 1.02ms, p90 1.22ms, max 1.52ms (~945 Hz max poll rate) | throwaway `uv`-managed Python 3.12 venv + `lerobot-sim[feetech]`, read-only (`connect(calibrate=False)`, never writes to the servos) |
-| Sim `env.step()` on `Lerobot-So101-Teleop-Vials-To-Rack` (closest existing task — quality-mode RTX rendering, 2 cameras × rgb/depth/instance-seg, 60 samples) | mean **236ms**, p50 242ms, p90 312ms, max 401ms (~4.2 Hz implied control rate) | headless `isaaclab.app.AppLauncher` via `Y:\e\Scripts\python.exe`, same technique as §2/§6 |
+| A — Isaac-Lab values, **unconverted** | `4 / 0.3` | `59.956°` |
+| B — Isaac-Lab values × `π/180` | `~0.070 / ~0.0052` | `59.926°` (worst of the three) |
+| C — raw file's own default | `17.8 / 0.6` | `59.999°` |
 
-The leader-arm read is not the bottleneck — it's under 0.5% of total loop time. **The entire
-teleop loop's latency is the sim-side render/physics step**, and at ~236ms mean that's an
-effective ~4.2Hz control rate, which will feel noticeably laggy for live teleoperation (20-30Hz+
-is the usual target for a responsive feel). This is measured on the *existing* Vials-To-Rack
-task's camera/render config, not the new task, but it's the closest available proxy and the
-dominant cost (quality RTX + 2 cameras × 3 data types each = 6 render products) is exactly what
-stage 1 below deliberately avoids. If stage 2's camera turns out to reproduce this same ~200ms+
-per-step cost, it's worth reconsidering render mode (`"quality"` → `"performance"`) or trimming
-which camera data types are active during live teleop specifically (vs. dataset-recording runs,
-where slower-than-realtime stepping matters less).
+All three technically converge in an *unloaded* free swing (no resistance), so this alone
+doesn't prove torque authority — but combined with basic PD math (`torque = stiffness ×
+positionError`, clamped to `maxForce`), the converted values (B) simply can't generate
+meaningful torque against a real obstruction (e.g. a plausible 20°-blocked error × stiffness
+`0.07` ≈ `1.4 N·m`, vs `80 N·m` → clamped to the `30 N·m` limit for the unconverted value).
+Trial B was also measurably the least accurate tracker of the three, consistent with being the
+weakest. PhysX's drive equation evidently operates on radians internally regardless of how the
+joint's position/limits are authored/displayed in the USD file.
 
-Build and test in stages — each stage runnable with `keyboard_agent.py` (no hardware) before
-moving to the next:
-
-**Stage 1 — bare teleop.** Validates the real unknown (does the cube's rigid-body physics
-behave sensibly under gripper contact) before adding any bookkeeping on top.
-- `robot`: `S0101_CONTACT_GRASP_CFG.replace(prim_path=..., init_state=...)` positioned at
-  `(0, 0.3, 0.72)` — **use `S0101_CONTACT_GRASP_CFG`, not plain `SO101_CFG`**, even at this
-  stage, so the contact sensor added in stage 2 doesn't silently read zero force because
-  `activate_contact_sensors` was never set (easy to forget, matches what
-  `vials_to_rack_env_cfg.py`'s scene already does).
-- `room`: the `aws-cube-bowl-room.usda` wrapper.
-- `aws_cube`: `RigidObjectCfg` on the `AWSBuilderCube.usda` wrapper.
-- No sensors, no cameras, no observations/terminations beyond the base `ObservationsCfg`.
-- Register `Lerobot-So101-Teleop-Aws-Cube-To-Bowl` in `tasks/__init__.py`, same pattern as
-  the existing `Lerobot-So101-Teleop-Vials-To-Rack` registration.
-
-**Stage 2 — dataset-recording support** (only needed once `--repo_id` recording is wanted):
-- `contact_grasp`: `ContactSensorCfg` on `.../jaw`, `filter_prim_paths_expr=["...AwsCube"]`.
-- New `mdp/terms.py` functions `cube_grasped` / `cube_placed_in_bowl`, near-direct copies of
-  `any_vial_grasped` / `vial_placed_on_rack`, but with the rack's rectangular XY-bounds check
-  replaced by a box check sized to the bowl's real extent (`x:[-0.05,0.05] y:[-0.0375,0.0375]`
-  from §2), not a circular radius.
-- New `mdp/resets.py` function `reset_aws_cube`, a simplified single-object version of
-  `reset_vials_rack` (reuse the existing `random_asset_pose` helper already in that file).
-- `camera_ego`: point at `.../gripper/WristCamera` (verify this exact prim name at
-  implementation time — see the note in §2's camera row).
-
-**Stage 3 — eval variant** (only if/when automated eval is wanted, not required for
-teleoperation itself): `Lerobot-So101-Teleop-Aws-Cube-To-Bowl-Eval` with a
-`cube_placed_in_bowl_termination` `DoneTerm`, copying `vial_placed_on_rack_termination`'s
-confirm-steps structure.
-
-**Teleop command (unchanged at every stage):**
+**Fix:** use `SO101_CFG`'s stiffness/damping numbers **directly, unconverted**:
+```python
+JOINT_GAINS = {
+    "Rotation": dict(stiffness=55, damping=0.7, effort_limit=30),
+    "Pitch": dict(stiffness=30, damping=0.8, effort_limit=30),
+    "Elbow": dict(stiffness=25, damping=0.7, effort_limit=30),
+    "Wrist_Pitch": dict(stiffness=12, damping=0.5, effort_limit=30),
+    "Wrist_Roll": dict(stiffness=7, damping=0.5, effort_limit=30),
+    "Jaw": dict(stiffness=4, damping=0.3, effort_limit=30),
+}
 ```
-python -m sim_to_real_so101.scripts.lerobot_agent \
-    --task Lerobot-So101-Teleop-Aws-Cube-To-Bowl \
-    --port COM4 --robot_id my_so_arm
+`effort_limit`/`maxForce` (torque) is unit-agnostic either way, unaffected by this. **Confirmed
+working by the user directly** after this fix — real grasp torque, cube can be picked up.
+
+### 4.3 Cube behaved like a static wall
+
+**Root cause:** per §3, `AWSBuilderCube` has collision geometry but no `RigidBodyAPI`/`MassAPI`
+authored in the raw file.
+
+**Fix:** applied at runtime, right after opening the stage:
+```python
+if not cube_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+    UsdPhysics.RigidBodyAPI.Apply(cube_prim)
+if not cube_prim.HasAPI(UsdPhysics.MassAPI):
+    UsdPhysics.MassAPI.Apply(cube_prim).CreateMassAttr(0.05)  # 50g, an estimate
 ```
+The `0.05kg` mass is an estimate, not a measured value — worth a real weighing if precise
+dynamics ever matter.
 
-### Calibration — correction
+## 5. Not yet done — real leader-arm (COM4) input
 
-The `--robot_id` above is `my_so_arm`, **not** `armatron_leader` as an earlier revision of
-this plan assumed (that name came from `lerobot-sim/CLAUDE.md`, which is stale/refers to a
-different setup). Checked [`calibration/`](../calibration) directly:
-- `calibration/robots/so_follower/my_so_arm.json` — follower calibration
-- `calibration/teleoperators/so_leader/my_so_arm.json` — leader calibration
+Today's script only takes keyboard input. Getting the real SO-101 leader arm driving this same
+loop is conceptually straightforward and doesn't need Isaac Lab either — the unit-conversion
+math already exists in
+[`utils/lerobot_interface.py`](../source/sim_to_real_so101/utils/lerobot_interface.py)'s
+`LeRobotSO101Interface`, framework-agnostic (`get_mapped_actions_vectorized()` just does
+degree/radian + range remapping on plain numpy arrays, no `isaaclab` import). The real work
+would be:
 
-Both use the same id, `my_so_arm` — that's fine, not a collision, since lerobot namespaces
-calibration lookup by robot-type subfolder (`robots/so_follower/` vs `teleoperators/so_leader/`),
-confirmed by `HF_LEROBOT_CALIBRATION / "robots" / "so_follower" / f"{robot_id}.json"` in
-[`docker/real/scripts/so101_check_calibration.py:200`](../docker/real/scripts/so101_check_calibration.py).
+1. Read `robot.get_action()` from a `LeRobotSO101Interface(kind="leader", port="COM4",
+   id="my_so_arm")` each tick instead of `keyboard_control.get_joint_deltas(...)`.
+2. Convert to the same degrees-space this script already targets (the interface's mapping
+   currently targets *radians* for the Isaac-Lab task's action space — needs re-deriving for
+   degrees, or convert its radian output × `180/π` before writing to `targetPosition`).
+3. The `lerobot` pip package (the vendored `lerobot-sim` fork) is **not installed** anywhere
+   this script can currently run — would need installing into whatever Python runs this script.
+4. Calibration: `--robot_id my_so_arm` (not `armatron_leader` — that name is stale, from a
+   different `lerobot-sim` context). `HF_LEROBOT_CALIBRATION` env var defaults to
+   `~/.cache/huggingface/lerobot/calibration`, not this repo's `calibration/` folder — point it
+   there, or pass `calibration_dir` explicitly, before wiring up real hardware.
 
-**One thing to confirm before running any teleop command**: `HF_LEROBOT_CALIBRATION`
-(env var) defaults to `~/.cache/huggingface/lerobot/calibration`
-([`lerobot/utils/constants.py:74-75`](../lerobot-sim/src/lerobot/utils/constants.py)), not
-this repo's `calibration/` folder — no script in this repo hardcodes pointing at the
-project-local one. Either set `HF_LEROBOT_CALIBRATION=<repo>/calibration` before running
-`lerobot_agent.py`, or pass `--robot.calibration_dir`/`--teleop.calibration_dir` explicitly
-(both `RobotConfig`/`TeleoperatorConfig` have a `calibration_dir: Path | None = None` field),
-or confirm the calibration files are already copied/symlinked into the default HF cache path.
+No grasp/placement *detection* exists either (the physical pick-and-place works; nothing
+watches for "cube is in the bowl now"). Reimplementing that without Isaac Lab's manager/sensor
+API would mean reading `ContactSensor`-equivalent contact data via raw PhysX tensor APIs
+directly (`omni.physics.tensors`) and a plain box-bounds check — doable, not yet built.
 
-## 5. Isaac Sim 6.0.1 constraint
+## 6. Isaac Sim inspection technique (gotchas)
 
-Update: **Isaac Sim 6.0.1 is in fact installed locally** — `C:\Isaac-Sim` (`VERSION` file:
-`6.0.1-rc.7+release.42383.32955d8d.gl`), a full GUI-capable install accessible under this
-session's user account. There's also a second environment, `C:\ilab\e6`
-(`isaaclab==3.0.0b2.post1` + `isaacsim==6.0.1.0`, per `pip install` log
-`C:\ilab\install_isaaclab3.log`), with real validation logs already produced on 2026-08-13
-(`smoke_isaaclab3.log`, `list_envs_e6.log`, `zero_agent_e6.log`/`.err.log`) — but that venv
-was created under a **different Windows user profile** (`GUA-ADMIN`, per its
-`pyvenv.cfg` and the paths in its logs, e.g.
-`C:\Users\GUA-ADMIN\Desktop\Aakash\Sim-to-Real-SO-101-Workshop\...`), so this session
-(`OMNI-User`) gets `permission denied (os error 5)` trying to execute its Python directly —
-its logs are read-only evidence, not something this session can currently re-run. Worth
-confirming with the user whether that's a teammate's/setup script's environment they intend
-to keep using, or whether a fresh `OMNI-User`-owned Isaac Lab 3.0 venv should be created.
-
-**Isaac Sim 6.0.1 pairs with Isaac Lab 3.0 (currently Beta 2 - Patch 1)**, described by Isaac
-Lab's own release notes as introducing "a ground-up architectural overhaul" — a factory-based
-multi-backend physics architecture (PhysX / Newton / OVPhysX). There is no Isaac Lab 2.x
-release targeting Isaac Sim 6.0.1. This is a whole-repo concern, not something scoped to just
-this new task — confirmed concretely below.
-
-### What the existing `e6` validation logs already show
-
-- `smoke_isaaclab3.log`: basic Isaac Lab 3.0 functionality works — "stepped 10 sim steps OK,
-  device = cuda:0", "197 Isaac tasks registered in gym", "SMOKE: ALL OK".
-- `list_envs_e6.log`: running **this repo's own** `sim_to_real_so101.scripts.list_envs`
-  against Isaac Lab 3.0 / Isaac Sim 6.0.1 successfully lists all 6 currently-registered gym
-  tasks (`Lerobot-So101-Teleop-Base`, `-Task`, `-Vials-To-Rack`, `-Vials-To-Rack-DR`,
-  `-Vials-To-Rack-Eval`, `-Vials-To-Rack-DR-Eval`) — package import and gym registration
-  succeed end to end.
-- `zero_agent_e6.err.log`: **but actually running one of these tasks crashes**:
+- `C:\Isaac-Sim\python.bat` alone can't import `pxr` — needs `isaacsim.SimulationApp` to boot
+  Kit first, which registers the extensions that make `pxr` importable.
+- For pure USD inspection with no simulation/rendering needed at all (reading/checking `.usd`
+  files without booting Kit), a throwaway `usd-core` pip venv is much faster:
+  ```powershell
+  uv venv --python 3.11 --seed usdenv
+  usdenv\Scripts\python.exe -m pip install usd-core
   ```
-  File ".../source/sim_to_real_so101/tasks/task_env_cfg.py", line 26, in <module>
-      from isaacsim.core.utils.rotations import euler_angles_to_quat
-  ModuleNotFoundError: No module named 'isaacsim.core.utils'
-  ```
-
-### Confirmed root cause and fix
-
-Checked this exact import against the locally-installed `C:\Isaac-Sim` 6.0.1 (via
-`isaacsim.SimulationApp`, same technique as §6): **`isaacsim.core.utils.rotations` imports
-fine there.** So this isn't "Isaac Sim 6.0.1 removed the old Core API" outright — it's
-launch-path-dependent (Isaac Lab 3.0's new "kit-less execution mode" is the likely
-differentiator: `list_envs.py` and the smoke test evidently loaded whatever extension provides
-`isaacsim.core.utils`, `zero_agent.py`'s launch path didn't). That makes it a landmine that
-may or may not trigger depending on exactly how the app is launched — not something safe to
-leave alone just because it happens to work in one invocation.
-
-Verified the replacement directly (`inspect.signature` + a live call, same technique):
-`isaacsim.core.experimental.utils.transform.euler_angles_to_quaternion` is the Core
-Experimental API equivalent — confirmed present, and numerically identical for the same input
-(`[0,0,90]` degrees → `(0.7071, 0, 0, 0.7071)` from both). Same semantics (`euler_angles`,
-`degrees`, `extrinsic` params; returns quaternion as **(w,x,y,z)**, matching the convention
-already recorded for `look_at_quaternion` in the same module — see
-[[isaac_sim_look_at_quaternion_order]]). Two call-site changes needed when migrating:
-- `degrees` becomes **keyword-only** (`def euler_angles_to_quaternion(euler_angles, *, degrees=False, ...)`) — positional calls like `euler_angles_to_quat(arr, True)` would break; every call site in this repo already uses `degrees=True` as a keyword, so this is a non-issue in practice, just worth knowing.
-- Return type is **`wp.array`, not `numpy.ndarray`** — call sites that hand the result straight
-  to `InitialStateCfg(rot=...)`/`AssetBaseCfg.InitialStateCfg(rot=...)` (a plain-array-like
-  field, not a live physics tensor) need `.numpy()` appended, e.g.
-  `euler_angles_to_quaternion(np.array([0,0,90]), degrees=True).numpy()`.
-
-**Exact call sites needing this migration** (grepped repo-wide for
-`from isaacsim.core` — all four use the old rotations import except the second):
-1. [`assets/so101.py:22`](../source/sim_to_real_so101/assets/so101.py) —
-   `from isaacsim.core.utils.rotations import euler_angles_to_quat`
-2. [`mdp/resets.py:28`](../source/sim_to_real_so101/mdp/resets.py) —
-   `from isaacsim.core.prims import XFormPrim` (different symbol/submodule; imported fine in
-   the same spot-check on `C:\Isaac-Sim`, but treat that as "not yet proven safe under the
-   `e6`/kit-less launch path either," precisely because we just demonstrated that "works in
-   one environment" didn't predict the `zero_agent_e6` failure)
-3. [`tasks/task_env_cfg.py:26`](../source/sim_to_real_so101/tasks/task_env_cfg.py) —
-   `from isaacsim.core.utils.rotations import euler_angles_to_quat`
-4. [`tasks/vials_to_rack_env_cfg.py:26`](../source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py) —
-   same import
-
-**This directly blocks the new task as planned, not just the existing ones.** §4's scene
-deliberately avoids `SO101TaskSceneCfg`/`task_env_cfg.py` to sidestep the indoor-room/mat
-layout mismatch — but it still imports `SO101_CFG`/`S0101_CONTACT_GRASP_CFG` from
-`assets/so101.py` (site #1 above), which is unavoidable (every task in this repo needs the
-robot config), and stage 2's `reset_aws_cube` would live in `mdp/resets.py` (site #2). **Fix
-site #1 (and, defensively, #2) before or alongside writing the new task** — this is a
-prerequisite, not an optional smoke-test-later item.
-
-### Other requirements for new code in this plan
-
-1. Every new `mdp/terms.py`/`mdp/resets.py` function (`cube_grasped`, `cube_placed_in_bowl`,
-   `cube_placed_in_bowl_termination`, `reset_aws_cube`) **must** wrap every `.data.*` read in
-   `as_torch(...)`, matching `any_vial_grasped`/`vial_placed_on_rack` exactly.
-   [`mdp/_compat.py`](../source/sim_to_real_so101/mdp/_compat.py)'s docstring confirms exactly
-   why: *"Isaac Lab 2.x returns torch.Tensor from `.data.*` properties; Isaac Lab 3.0 returns
-   warp.array instead."* This was already a known, partially-solved problem in this codebase
-   before this planning session.
-2. If/when stage 2 adds a camera, prefer `CameraCfg` over `TiledCameraCfg` — 3.0 folds
-   `TiledCamera` into `Camera` ("existing tiled-camera aliases remain as compatibility surface
-   where available, but new code should use `Camera` and `CameraCfg`"). The existing
-   `camera_object` in `task_env_cfg.py` still uses `TiledCameraCfg` and should keep working
-   via the alias; no reason for *new* code to take on that deprecation.
-3. Keep `ImplicitActuatorCfg` for the robot's actuators (what `SO101_CFG` already uses) —
-   implicit PD-drive actuators are the simpler, lower-risk surface; nothing suggests they're
-   going away, unlike the explicit/Newton-unified actuator path.
-
-### Process recommendation
-
-Fix the 4 known import sites (§5 above) first, confirming each against whichever concrete
-Isaac Sim 6.0.1 / Isaac Lab 3.0 Python environment the user settles on (either get access
-sorted out for the existing `e6` venv, or stand up an `OMNI-User`-owned one) — then re-run
-`zero_agent.py`/`list_envs.py` against the **existing**, unmodified
-`Lerobot-So101-Teleop-Vials-To-Rack` task to confirm it actually steps physics end to end
-(not just imports/registers) before writing any of this plan's new task code. That task
-already exercises nearly every mechanism this plan needs: `ArticulationCfg`, `RigidObjectCfg`
-with `mass_props`/`rigid_props`, `ContactSensorCfg`, manager-based
-observations/events/terminations.
-
-## 6. Isaac Sim inspection technique (gotcha)
-
-For reference when re-verifying any of the above, or checking new USD edits:
-
-- `C:\Isaac-Sim\python.bat` alone can't import `pxr` — it needs `isaacsim.SimulationApp` (or
-  `isaaclab.app.AppLauncher`) to boot Kit first, which registers the extensions that make
-  `pxr` importable.
-- For scripts needing `isaaclab` APIs specifically (not just raw Isaac Sim), use this repo's
-  actual Isaac Lab venv, `Y:\e\Scripts\python.exe` (the one `docs/isaac-sim-windows-guide.md`
-  documents running the repo's own scripts with), with the same
-  `isaaclab.app.AppLauncher` boot pattern `keyboard_agent.py`/`lerobot_agent.py` use.
-- **Buffered stdout is silently dropped when `simulation_app.close()` runs** — Kit's shutdown
-  appears to force-terminate the process rather than doing a clean CPython exit, so anything
-  still sitting in Python's stdout buffer (block-buffered when redirected to a file/pipe)
-  never flushes; the log just cuts off mid-line with no error. Symptom looks like a hang or
-  silent crash. Fix: write results to your own file opened in the script and call `.flush()`
-  after every write, don't rely on `print()` + shell redirection alone.
+  This is what produced every fact in §3 — no GPU, no Kit, no rendering, just the schema API.
+- **`-m package.module` invocation fails** unless the package is actually importable from
+  `sys.path` *before* Python starts resolving `-m` — which happens before any in-script
+  `sys.path` manipulation can run. Use a direct file path instead when the package isn't
+  pip-installed in the target Python (confirmed: `C:\Isaac-Sim\python.bat` has no
+  `sim_to_real_so101` installed, only the Isaac-Lab venvs do via `pip install -e`).
+- **Buffered stdout is silently dropped when the process is killed/`simulation_app.close()`
+  runs** — Kit's shutdown force-terminates rather than doing a clean CPython exit, so anything
+  still sitting in Python's stdout buffer (block-buffered when redirected to a file/pipe) never
+  flushes; the log just cuts off mid-line with no error. Looks like a hang or silent crash.
+  Fix: write results to your own file opened in the script and call `.flush()` after every
+  write (or run Python with `-u` for unbuffered stdout), don't rely on `print()` + shell
+  redirection alone.
+- `importlib.metadata.version("isaacsim")` raises `PackageNotFoundError` on a plain Kit-app
+  install like `C:\Isaac-Sim` — it's not a pip package there, just a Kit extension tree.
+  `version_banner.py` falls back to reading the `VERSION` file at the path in the `ISAAC_PATH`
+  env var (set by `python.bat` itself), then to walking up from the `isaacsim` package's own
+  directory looking for the same file.
+- GUI windows launched through an automated tool/agent session may not attach to the
+  interactive window station even when `query session` reports the same session ID as the
+  visible desktop — a process can burn real GPU/CPU (confirmed: 53% 3D-engine utilization, 300+
+  CPU-seconds) rendering into a window that never actually appears on screen. If a launch looks
+  "stuck" with heavy resource use but zero visible window/taskbar entry, this is the likely
+  cause — run it from an actual interactive terminal instead.
 
 Full details also saved to memory: `isaac_sim_local_rtx_verification` and
 `real_to_sim_aws_cube_bowl_task`.

@@ -95,3 +95,21 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Lerobot-So101-Teleop-Aws-Cube-To-Bowl",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.aws_cube_to_bowl_env_cfg:AwsCubeToBowlEnvCfg",
+    },
+)
+
+gym.register(
+    id="Lerobot-So101-Teleop-Aws-Cube-To-Bowl-Dataset",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.aws_cube_to_bowl_env_cfg:AwsCubeToBowlDatasetEnvCfg",
+    },
+)
+
