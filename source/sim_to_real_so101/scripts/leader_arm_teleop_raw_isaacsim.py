@@ -146,7 +146,12 @@ JOINT_GAINS = {
     "Elbow": dict(stiffness=25, damping=0.7, effort_limit=30),
     "Wrist_Pitch": dict(stiffness=12, damping=0.5, effort_limit=30),
     "Wrist_Roll": dict(stiffness=7, damping=0.5, effort_limit=30),
-    "Jaw": dict(stiffness=4, damping=0.3, effort_limit=30),
+    # See keyboard_agent_raw_isaacsim.py's identical constant for the full
+    # empirical justification -- effort_limit=30 (untuned for load) let the
+    # jaw destabilize the contact solve and eject the cube when driven to
+    # full closure against it. effort_limit=3 is still ~250x this 0.05kg
+    # cube's actual holding-force requirement, so grip strength isn't lost.
+    "Jaw": dict(stiffness=4, damping=0.3, effort_limit=3),
 }
 JOINT_ORDER = list(JOINT_GAINS.keys())
 RAD_TO_DEG = 180.0 / 3.141592653589793

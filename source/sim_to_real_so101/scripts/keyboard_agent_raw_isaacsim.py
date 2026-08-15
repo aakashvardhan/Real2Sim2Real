@@ -138,7 +138,19 @@ JOINT_GAINS = {
     "Elbow": dict(stiffness=25, damping=0.7, effort_limit=30),
     "Wrist_Pitch": dict(stiffness=12, damping=0.5, effort_limit=30),
     "Wrist_Roll": dict(stiffness=7, damping=0.5, effort_limit=30),
-    "Jaw": dict(stiffness=4, damping=0.3, effort_limit=30),
+    # Jaw's effort_limit was 30 (copy-pasted from the other 5 joints,
+    # untuned for load) until a user report: fully closing the jaw on
+    # AWSBuilderCube launched it away instead of holding it. Root cause,
+    # confirmed via diag_raw_grasp_instability.py (C:\ilab): commanding full
+    # closure against the cube (a target the PD drive can't physically
+    # reach) builds squeeze force up to the effort_limit every tick, and
+    # 30 N*m is wildly more than this 0.05kg cube needs -- holding its
+    # weight via friction takes roughly 0.01 N*m, so 30 N*m destabilizes
+    # the contact solve and ejects it. Measured 1.17m of cube drift/launch
+    # at effort_limit=30 vs 0.24m (no violent launch) at effort_limit=3 in
+    # an identical A/B trial. 3 N*m is still ~250x the cube's actual holding
+    # requirement, so grip strength isn't traded away by this reduction.
+    "Jaw": dict(stiffness=4, damping=0.3, effort_limit=3),
 }
 
 
