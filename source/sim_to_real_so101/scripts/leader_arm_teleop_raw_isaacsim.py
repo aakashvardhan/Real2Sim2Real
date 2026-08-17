@@ -41,10 +41,17 @@ leader-arm-to-joint-target passthrough, plus a keyboard 'R' to reset the
 cube/bowl to their original positions (joint targets aren't reset-able here
 the way the keyboard script does it -- they're driven live by the leader arm
 every tick, not held state). No recording, no grasp/placement detection.
+
+Optional real-follower mirror (Phase 1+2 of
+docs/dual-teleop-sim-and-follower-plan.md): pass --follower_port (e.g. COM3)
+to also mirror the same leader reading, same tick, to a real SO-101 follower
+via LeRobotSO101Interface(kind="follower").send_action(). Unset (default):
+behavior is unchanged from the sim-only script described above.
 """
 import argparse
 import os
 import sys
+import time
 
 # Make sim_to_real_so101 importable without requiring an editable pip install
 # in whatever Python this script is run with (matches
@@ -71,7 +78,46 @@ parser.add_argument(
     help="Root calibration directory (expects <this>/teleoperators/so_leader/<robot_id>.json). "
     "Sets HF_LEROBOT_CALIBRATION -- must be set before `lerobot` is imported.",
 )
+parser.add_argument(
+    "--follower_port",
+    type=str,
+    default=None,
+    help="Real follower arm serial port (e.g. COM3). Unset (default) = today's sim-only behavior, "
+    "nothing else changed. When given, the same leader reading driving the sim is also mirrored "
+    "to a real follower on this port each tick -- see docs/dual-teleop-sim-and-follower-plan.md.",
+)
+parser.add_argument(
+    "--follower_robot_id",
+    type=str,
+    default="my_so_arm",
+    help="Follower arm calibration id (must match a file under calibration/robots/so_follower/). "
+    "Only used when --follower_port is given.",
+)
 args_cli = parser.parse_args()
+
+# Fail fast on a bad --robot_id/--calibration_dir (e.g. a typo) before paying
+# for Kit's ~30s+ boot below -- lerobot's own error for a missing calibration
+# file only surfaces later, inside connect(), with a much less obvious
+# traceback originating deep in its serial handshake code.
+_CALIBRATION_FILE = os.path.join(
+    args_cli.calibration_dir, "teleoperators", "so_leader", f"{args_cli.robot_id}.json"
+)
+if not os.path.isfile(_CALIBRATION_FILE):
+    print(f"[ERROR]: Calibration file not found: {_CALIBRATION_FILE}", file=sys.stderr)
+    print(
+        "[ERROR]: Check --robot_id / --calibration_dir (or TELEOP_ID / TELEOP_PORT env vars).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if args_cli.follower_port is not None:
+    _FOLLOWER_CALIBRATION_FILE = os.path.join(
+        args_cli.calibration_dir, "robots", "so_follower", f"{args_cli.follower_robot_id}.json"
+    )
+    if not os.path.isfile(_FOLLOWER_CALIBRATION_FILE):
+        print(f"[ERROR]: Follower calibration file not found: {_FOLLOWER_CALIBRATION_FILE}", file=sys.stderr)
+        print("[ERROR]: Check --follower_robot_id / --calibration_dir.", file=sys.stderr)
+        sys.exit(1)
 
 # Must happen before any `lerobot` import (including transitively, via
 # sim_to_real_so101.utils.lerobot_interface below) -- lerobot.utils.constants
@@ -156,6 +202,11 @@ JOINT_GAINS = {
 JOINT_ORDER = list(JOINT_GAINS.keys())
 RAD_TO_DEG = 180.0 / 3.141592653589793
 
+# Phase 2 timing measurement -- how often to flush the tick/send-time summary
+# (see the main loop). Deliberately periodic, not per-tick, per the plan's
+# "no per-tick spam" requirement.
+STATS_PRINT_INTERVAL_S = 5.0
+
 
 def main():
     usd_context = omni.usd.get_context()
@@ -236,9 +287,44 @@ def main():
         fps=30,
         kind="leader",
     )
-    robot_iface.init_device()
-    robot_iface.connect()
+    try:
+        robot_iface.init_device()
+        robot_iface.connect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to connect to the leader arm on port={args_cli.port} id={args_cli.robot_id}: {exc}. "
+            "Check the arm is powered, plugged into the given --port, and not already held open by "
+            "another process (e.g. a previous run that didn't exit cleanly)."
+        ) from exc
     connected = True
+
+    # Follower mirror -- only connected when --follower_port is given (see
+    # docs/dual-teleop-sim-and-follower-plan.md Phase 1). device="cuda" per
+    # the plan: this machine has an NVIDIA GPU, unlike the leader interface
+    # above which stays device="cpu" (unchanged, out of scope here).
+    follower_iface = None
+    follower_connected = False
+    follower_send_failed = False
+    if args_cli.follower_port is not None:
+        follower_iface = LeRobotSO101Interface(
+            device="cuda",
+            port=args_cli.follower_port,
+            id=args_cli.follower_robot_id,
+            cameras={},
+            fps=30,
+            kind="follower",
+        )
+        try:
+            follower_iface.init_device()
+            follower_iface.connect()
+            follower_connected = True
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to connect to the follower arm on port={args_cli.follower_port} "
+                f"id={args_cli.follower_robot_id}: {exc}. Check the arm is powered, plugged into the "
+                "given --follower_port, and not already held open by another process."
+            ) from exc
+        print(f"[INFO]: Follower arm connected: port={args_cli.follower_port} id={args_cli.follower_robot_id}")
 
     keyboard_control = KeyboardControl()
 
@@ -248,14 +334,31 @@ def main():
     print("[INFO]: Driving joints from the leader arm. Ctrl+C or close the window to stop.")
     print("[INFO]: Click 'R' to reset the cube/bowl to their original positions")
 
+    # Phase 2: measure, don't assume, the cost of a blocking follower serial
+    # write on Kit's clock. Accumulated and flushed as a periodic summary
+    # (not per-tick, to avoid log spam) so a --follower_port run's tick time
+    # can be compared against a --follower_port-unset run.
+    tick_count = 0
+    tick_time_total = 0.0
+    send_time_total = 0.0
+    send_count = 0
+    last_stats_print = time.perf_counter()
+
     try:
         while simulation_app.is_running():
+            tick_start = time.perf_counter()
+
             if keyboard_control.reset_world:
                 restore_prim_pose(cube_prim, cube_orig_pose, zero_velocity=True)
                 restore_prim_pose(bowl_prim, bowl_orig_pose)
                 keyboard_control.reset_world = False
 
-            real_action = robot_iface.robot.get_action()
+            try:
+                real_action = robot_iface.robot.get_action()
+            except Exception as exc:
+                print(f"[ERROR]: Lost connection to the leader arm: {exc}")
+                break
+
             raw_tensor = robot_iface.get_raw_actions_tensor(real_action)
             mapped_deg = robot_iface.get_mapped_actions_vectorized(raw_tensor) * RAD_TO_DEG
 
@@ -264,11 +367,58 @@ def main():
                 clamped = max(info["lower"], min(info["upper"], target_deg))
                 info["target_attr"].Set(clamped)
 
+            # Mirror the same leader reading to the real follower, same tick,
+            # unmodified raw dict -- no unit conversion needed, real_action is
+            # already in the native lerobot key space a follower's
+            # send_action() expects. See dual-teleop-sim-and-follower-plan.md
+            # Phase 1 (why no conversion) and Phase 2 (why the try/except and
+            # the timing measurement below).
+            if follower_connected and not follower_send_failed:
+                send_start = time.perf_counter()
+                try:
+                    follower_iface.robot.send_action(real_action)
+                except Exception as exc:
+                    follower_send_failed = True
+                    print(
+                        f"[ERROR]: Lost connection to the follower arm, no longer mirroring to it "
+                        f"for the rest of this run (sim continues normally): {exc}"
+                    )
+                else:
+                    send_time_total += time.perf_counter() - send_start
+                    send_count += 1
+
             simulation_app.update()
+
+            tick_count += 1
+            tick_time_total += time.perf_counter() - tick_start
+            now = time.perf_counter()
+            if now - last_stats_print >= STATS_PRINT_INTERVAL_S:
+                avg_tick_ms = (tick_time_total / tick_count) * 1000.0
+                if send_count:
+                    avg_send_ms = (send_time_total / send_count) * 1000.0
+                    print(
+                        f"[INFO]: avg tick={avg_tick_ms:.2f} ms over {tick_count} ticks "
+                        f"(avg follower send_action={avg_send_ms:.2f} ms over {send_count} sends)"
+                    )
+                else:
+                    print(f"[INFO]: avg tick={avg_tick_ms:.2f} ms over {tick_count} ticks")
+                tick_count = 0
+                tick_time_total = 0.0
+                send_time_total = 0.0
+                send_count = 0
+                last_stats_print = now
     finally:
         keyboard_control.cleanup()
         if connected:
-            robot_iface.robot.disconnect()
+            try:
+                robot_iface.robot.disconnect()
+            except Exception as exc:
+                print(f"[WARN]: Failed to cleanly disconnect the leader arm: {exc}")
+        if follower_connected:
+            try:
+                follower_iface.robot.disconnect()
+            except Exception as exc:
+                print(f"[WARN]: Failed to cleanly disconnect the follower arm: {exc}")
         timeline.stop()
 
 
