@@ -47,6 +47,18 @@ docs/dual-teleop-sim-and-follower-plan.md): pass --follower_port (e.g. COM3)
 to also mirror the same leader reading, same tick, to a real SO-101 follower
 via LeRobotSO101Interface(kind="follower").send_action(). Unset (default):
 behavior is unchanged from the sim-only script described above.
+
+Optional real-cube pose mirror (Phase 2 of
+docs/object-pose-mirroring-plan.md): pass --track_camera (top camera's
+OpenCV index) + --marker_size_m to make AWSBuilderCube a full kinematic
+puppet of its camera-tracked real-world pose every tick, via ArUco
+detection (source/sim_to_real_so101/utils/marker_tracking.py) against a
+one-time camera calibration (calibrate_camera_intrinsics.py,
+calibrate_camera_extrinsics.py). Needs Phase 0's physical marker placement
+and camera calibration done first -- fails fast before Kit boots if the
+calibration files aren't there. Unset (default): behavior is unchanged
+from the sim-only script described above (dynamic, grippable, resettable
+cube).
 """
 import argparse
 import os
@@ -93,6 +105,30 @@ parser.add_argument(
     help="Follower arm calibration id (must match a file under calibration/robots/so_follower/). "
     "Only used when --follower_port is given.",
 )
+parser.add_argument(
+    "--track_camera",
+    type=int,
+    default=None,
+    help="Top camera's OpenCV index. Unset (default) = today's unchanged behavior (dynamic, "
+    "grippable, resettable AWSBuilderCube). When given, the cube becomes a kinematic puppet of "
+    "its camera-tracked real-world pose every tick -- see docs/object-pose-mirroring-plan.md Phase 2.",
+)
+parser.add_argument(
+    "--marker_size_m",
+    type=float,
+    default=None,
+    help="Cube's printed ArUco marker side length, meters. Required when --track_camera is given.",
+)
+parser.add_argument(
+    "--cube_marker_id", type=int, default=0, help="ArUco id printed on the cube's marker. Only used with --track_camera."
+)
+parser.add_argument(
+    "--camera_calibration_dir",
+    type=str,
+    default=os.path.join(_REPO_ROOT_DIR, "calibration", "camera"),
+    help="Directory with top_camera_intrinsics.json / top_camera_extrinsics.json (Phase 0 output of "
+    "calibrate_camera_intrinsics.py / calibrate_camera_extrinsics.py). Only used with --track_camera.",
+)
 args_cli = parser.parse_args()
 
 # Fail fast on a bad --robot_id/--calibration_dir (e.g. a typo) before paying
@@ -119,6 +155,22 @@ if args_cli.follower_port is not None:
         print("[ERROR]: Check --follower_robot_id / --calibration_dir.", file=sys.stderr)
         sys.exit(1)
 
+if args_cli.track_camera is not None:
+    if args_cli.marker_size_m is None:
+        print("[ERROR]: --marker_size_m is required when --track_camera is given.", file=sys.stderr)
+        sys.exit(1)
+    _CAMERA_INTRINSICS_FILE = os.path.join(args_cli.camera_calibration_dir, "top_camera_intrinsics.json")
+    _CAMERA_EXTRINSICS_FILE = os.path.join(args_cli.camera_calibration_dir, "top_camera_extrinsics.json")
+    for _camera_calib_file in (_CAMERA_INTRINSICS_FILE, _CAMERA_EXTRINSICS_FILE):
+        if not os.path.isfile(_camera_calib_file):
+            print(f"[ERROR]: Camera calibration file not found: {_camera_calib_file}", file=sys.stderr)
+            print(
+                "[ERROR]: Run calibrate_camera_intrinsics.py then calibrate_camera_extrinsics.py first "
+                "(see docs/object-pose-mirroring-plan.md Phase 0).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
 # Must happen before any `lerobot` import (including transitively, via
 # sim_to_real_so101.utils.lerobot_interface below) -- lerobot.utils.constants
 # reads this env var at import time to compute HF_LEROBOT_CALIBRATION, and
@@ -133,13 +185,23 @@ simulation_app = SimulationApp({"headless": args_cli.headless})
 
 import omni.timeline  # noqa: E402
 import omni.usd  # noqa: E402
-from pxr import Gf, UsdPhysics  # noqa: E402
+from pxr import Gf, UsdGeom, UsdPhysics  # noqa: E402
 
 from sim_to_real_so101.utils.keyboard import KeyboardControl  # noqa: E402
 from sim_to_real_so101.utils.lerobot_interface import LeRobotSO101Interface  # noqa: E402
 from sim_to_real_so101.utils.physics_material import apply_friction_material  # noqa: E402
 from sim_to_real_so101.utils.scene_reset import restore_prim_pose, snapshot_xform_ops  # noqa: E402
 from sim_to_real_so101.utils.version_banner import print_simulator_version_banner  # noqa: E402
+
+if args_cli.track_camera is not None:
+    import cv2  # noqa: E402
+
+    from sim_to_real_so101.utils.marker_tracking import (  # noqa: E402
+        detect_markers,
+        load_camera_calibration,
+        marker_pose_to_world,
+        solve_marker_pose_camera_frame,
+    )
 
 print_simulator_version_banner()
 
@@ -224,6 +286,25 @@ def main():
     if not cube_prim.HasAPI(UsdPhysics.MassAPI):
         UsdPhysics.MassAPI.Apply(cube_prim).CreateMassAttr(AWS_CUBE_MASS_KG)
 
+    # Phase 2 of docs/object-pose-mirroring-plan.md: a kinematic rigid body
+    # still participates in PhysX collision *response on other bodies* (the
+    # gripper pads won't clip through it) but its own pose is driven
+    # externally every tick instead of being force-integrated -- exactly
+    # what a camera-tracked puppet needs. AWSBuilderCube authors only
+    # xformOp:translate (verified 2026-08-18, no xformOp:orient) -- add one
+    # so orientation can be written each tick too, matching PaperBowl's own
+    # existing translate+orient+scale convention (float-precision quatf).
+    cube_orient_op = None
+    if args_cli.track_camera is not None:
+        UsdPhysics.RigidBodyAPI(cube_prim).CreateKinematicEnabledAttr().Set(True)
+        cube_xformable = UsdGeom.Xformable(cube_prim)
+        for op in cube_xformable.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                cube_orient_op = op
+                break
+        if cube_orient_op is None:
+            cube_orient_op = cube_xformable.AddOrientOp()
+
     cube_collision_mesh = stage.GetPrimAtPath(AWS_CUBE_COLLISION_MESH_PATH)
     if not cube_collision_mesh.IsValid():
         raise RuntimeError(f"Expected prim not found: {AWS_CUBE_COLLISION_MESH_PATH}")
@@ -244,9 +325,19 @@ def main():
         raise RuntimeError(f"Expected prim not found: {PAPER_BOWL_PRIM_PATH}")
 
     # Captured before the timeline plays, so this is each prim's originally
-    # authored pose -- restored on 'R'.
+    # authored pose -- restored on 'R' (cube skipped once --track_camera is
+    # set, since software can't move the real object -- see the main loop).
     cube_orig_pose = snapshot_xform_ops(cube_prim)
     bowl_orig_pose = snapshot_xform_ops(bowl_prim)
+
+    cube_translate_op = None
+    if args_cli.track_camera is not None:
+        for op in UsdGeom.Xformable(cube_prim).GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                cube_translate_op = op
+                break
+        if cube_translate_op is None:
+            raise RuntimeError(f"Expected xformOp:translate on {AWS_CUBE_PRIM_PATH}, found none.")
 
     # See keyboard_agent_raw_isaacsim.py -- root_joint's body0 binds to the
     # physics scene's literal origin, not the ancestor Xform's real position.
@@ -326,6 +417,29 @@ def main():
             ) from exc
         print(f"[INFO]: Follower arm connected: port={args_cli.follower_port} id={args_cli.follower_robot_id}")
 
+    # Cube pose tracking -- only opened when --track_camera is given (see
+    # docs/object-pose-mirroring-plan.md Phase 2). last_known_cube_pos/quat
+    # start None and are only ever updated on a successful detection, so a
+    # missed/occluded frame holds the cube at its last good pose instead of
+    # snapping to origin or writing a NaN transform.
+    cube_camera_capture = None
+    cube_calibration = None
+    last_known_cube_pos = None
+    last_known_cube_quat = None
+    if args_cli.track_camera is not None:
+        cube_calibration = load_camera_calibration(_CAMERA_INTRINSICS_FILE, _CAMERA_EXTRINSICS_FILE)
+        cube_camera_capture = cv2.VideoCapture(args_cli.track_camera)
+        if not cube_camera_capture.isOpened():
+            raise RuntimeError(
+                f"Failed to open top camera index={args_cli.track_camera}. Check it's plugged in and "
+                "not held open by another process (e.g. Windows Camera app -- a real cause seen "
+                "getting this pipeline working, see docs/object-pose-mirroring-plan.md)."
+            )
+        print(
+            f"[INFO]: Tracking cube (marker id={args_cli.cube_marker_id}) on top camera "
+            f"index={args_cli.track_camera}."
+        )
+
     keyboard_control = KeyboardControl()
 
     print_simulator_version_banner()
@@ -349,7 +463,10 @@ def main():
             tick_start = time.perf_counter()
 
             if keyboard_control.reset_world:
-                restore_prim_pose(cube_prim, cube_orig_pose, zero_velocity=True)
+                if cube_camera_capture is None:
+                    restore_prim_pose(cube_prim, cube_orig_pose, zero_velocity=True)
+                else:
+                    print("[INFO]: Cube reset skipped -- camera-tracked, can't move the real object.")
                 restore_prim_pose(bowl_prim, bowl_orig_pose)
                 keyboard_control.reset_world = False
 
@@ -366,6 +483,30 @@ def main():
                 info = joints[joint_name]
                 clamped = max(info["lower"], min(info["upper"], target_deg))
                 info["target_attr"].Set(clamped)
+
+            # Cube pose puppet -- full kinematic override every tick, same
+            # spirit as the follower-arm mirror below: the sim cube tracks
+            # the real cube regardless of what the sim gripper is doing
+            # (see docs/object-pose-mirroring-plan.md's "full kinematic
+            # puppet" design decision). A miss this frame (occlusion,
+            # marker out of view) just holds last_known_cube_pos/quat --
+            # deliberately not an error.
+            if cube_camera_capture is not None:
+                cam_ok, cam_frame = cube_camera_capture.read()
+                if cam_ok:
+                    detected_markers = detect_markers(cam_frame)
+                    if args_cli.cube_marker_id in detected_markers:
+                        rvec, tvec = solve_marker_pose_camera_frame(
+                            detected_markers[args_cli.cube_marker_id], args_cli.marker_size_m, cube_calibration
+                        )
+                        last_known_cube_pos, last_known_cube_quat = marker_pose_to_world(
+                            rvec, tvec, cube_calibration
+                        )
+                if last_known_cube_pos is not None:
+                    px, py, pz = last_known_cube_pos.tolist()
+                    cube_translate_op.Set(Gf.Vec3d(px, py, pz))
+                    qw, qx, qy, qz = last_known_cube_quat.tolist()
+                    cube_orient_op.Set(Gf.Quatf(qw, qx, qy, qz))
 
             # Mirror the same leader reading to the real follower, same tick,
             # unmodified raw dict -- no unit conversion needed, real_action is
@@ -419,6 +560,8 @@ def main():
                 follower_iface.robot.disconnect()
             except Exception as exc:
                 print(f"[WARN]: Failed to cleanly disconnect the follower arm: {exc}")
+        if cube_camera_capture is not None:
+            cube_camera_capture.release()
         timeline.stop()
 
 

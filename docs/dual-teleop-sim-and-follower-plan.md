@@ -282,19 +282,13 @@ demonstrated, not just assumed from the two independent phase tests above.
 - **Two-process/IPC redesign** — only revisit if Phase 2's timing
   measurement shows `send_action()` materially hurting Kit's frame rate.
   Don't build preemptively.
-- **Real-world placement detection** (cube resting in the bowl) — no
-  proprioceptive signal exists for a released, free object, so this needs a
-  camera and a perception step, which is a materially bigger addition
-  (hardware, calibration, pipeline) than everything above. Pointer for
-  later: fiducial markers (OpenCV `cv2.aruco`, `DICT_APRILTAG_36h11` or
-  `DICT_4X4_50`) over a segmentation model — cheap, precise 6-DoF pose, no
-  learned model needed. One tag per object, fixed measured size; one tag on
-  the cube's top face (only needs visibility after release); since
-  `PaperBowl` is static/untouched in this whole setup, its real-world
-  bounding region only needs recording once via a tag placed next to it at
-  setup time. Either way, a one-time camera-to-robot extrinsic calibration
-  is still needed so detected poses land in the same frame
-  `AWSBuilderCube`/`PaperBowl` already use in sim.
+- **Real-world object pose mirroring** (cube + bowl placement/movement) —
+  now has its own full plan:
+  [object-pose-mirroring-plan.md](object-pose-mirroring-plan.md). Uses the
+  top camera (separate from the wrist camera) + `cv2.aruco` fiducial
+  markers + a one-time camera-to-world extrinsic calibration, kinematically
+  puppeting `AWSBuilderCube`/`PaperBowl` in sim from the tracked real pose
+  every tick — the object-level analog of this plan's arm mirror.
 
 ---
 
