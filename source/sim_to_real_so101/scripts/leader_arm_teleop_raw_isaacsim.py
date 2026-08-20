@@ -52,10 +52,17 @@ Real cube/bowl positions (see docs/object-pose-mirroring-plan.md for the
 camera-tracking approach this replaces -- dropped in favor of a one-time
 manual measurement, since the objects don't move between episodes and a
 tracker's calibration cost/OOD risk isn't worth it for this purpose):
-REAL_CUBE_POS / REAL_BOWL_POS below are measured from the real workspace and
-applied at startup, overridable via --cube_pos / --bowl_pos without a code
-edit. The cube stays fully dynamic (grippable, physics-driven) throughout --
-only its *starting* pose is overridden, not puppeteered every tick.
+a fixed-layout config (utils/fixed_workspace.py) expresses the cube/bowl
+poses relative to the SO-101 base mounting point, converted to Isaac world
+poses at startup -- pass --layout <path> to point at a measured layout JSON
+(see calibration/workspaces/aws_cube_bowl_fixed.json and
+docs/aws-cube-to-bowl-run-guide.md), or omit it to fall back to an in-code
+legacy layout equivalent to this file's old hardcoded world-frame constants.
+--cube_pos / --bowl_pos (world-frame x,y,z) and --cube_yaw_deg /
+--bowl_yaw_deg still work exactly as before, as CLI overrides on top of
+whichever layout is in effect. The cube stays fully dynamic (grippable,
+physics-driven) throughout -- only its *starting* pose is overridden, not
+puppeteered every tick.
 """
 import argparse
 import os
@@ -70,6 +77,11 @@ _REPO_SOURCE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 if _REPO_SOURCE_DIR not in sys.path:
     sys.path.insert(0, _REPO_SOURCE_DIR)
 _REPO_ROOT_DIR = os.path.dirname(_REPO_SOURCE_DIR)
+
+# Pure config/math (json/math/dataclasses only) -- deliberately importable
+# before Kit boots, unlike sim_to_real_so101.utils.keyboard/etc below, which
+# transitively need omni/pxr and are imported only after SimulationApp().
+from sim_to_real_so101.utils import fixed_workspace  # noqa: E402
 
 parser = argparse.ArgumentParser(description="Raw Isaac Sim SO-101 leader-arm teleop agent (no Isaac Lab).")
 parser.add_argument("--headless", action="store_true", default=False, help="Run without a viewport window.")
@@ -106,16 +118,42 @@ parser.add_argument(
     "--cube_pos",
     type=str,
     default=None,
-    help="Override REAL_CUBE_POS as 'x,y,z' in meters (world frame). Unset (default) = use the "
-    "measured constant in this file. See the object-pose-mirroring plan for how to re-measure "
-    "if the real cube's position changes.",
+    help="Override the cube's resolved position as 'x,y,z' in meters (world frame, absolute -- "
+    "bypasses the --layout base-frame math entirely). Unset (default) = use --layout (or the "
+    "legacy default if --layout is unset).",
 )
 parser.add_argument(
     "--bowl_pos",
     type=str,
     default=None,
-    help="Override REAL_BOWL_POS as 'x,y,z' in meters (world frame). Unset (default) = use the "
-    "measured constant in this file.",
+    help="Override the bowl's resolved position as 'x,y,z' in meters (world frame, absolute -- "
+    "bypasses the --layout base-frame math entirely). Unset (default) = use --layout (or the "
+    "legacy default if --layout is unset).",
+)
+parser.add_argument(
+    "--layout",
+    type=str,
+    default=None,
+    help="Path to a fixed-workspace layout JSON (e.g. calibration/workspaces/aws_cube_bowl_fixed.json) "
+    "defining the cube/bowl poses relative to the SO-101 base frame. Unset (default) = an in-code "
+    "legacy layout that reproduces this file's old hardcoded REAL_CUBE_POS/REAL_BOWL_POS world "
+    "constants exactly. See docs/aws-cube-to-bowl-run-guide.md for the schema and measurement "
+    "procedure. Precedence: --cube_pos/--bowl_pos/--cube_yaw_deg/--bowl_yaw_deg (if given) > this "
+    "layout > the legacy default.",
+)
+parser.add_argument(
+    "--cube_yaw_deg",
+    type=float,
+    default=None,
+    help="Override the cube's yaw (degrees, about +Z, base-frame convention) from the layout. "
+    "Unset (default) = use the layout's cube.yaw_deg (0.0 if no --layout given).",
+)
+parser.add_argument(
+    "--bowl_yaw_deg",
+    type=float,
+    default=None,
+    help="Override the bowl's yaw (degrees, about +Z, base-frame convention) from the layout. "
+    "Unset (default) = use the layout's bowl.yaw_deg (0.0 if no --layout given).",
 )
 args_cli = parser.parse_args()
 
@@ -143,11 +181,12 @@ if args_cli.follower_port is not None:
         print("[ERROR]: Check --follower_robot_id / --calibration_dir.", file=sys.stderr)
         sys.exit(1)
 
-def _validate_vec3_str(arg_name: str, value: str | None) -> None:
+def _parse_vec3_str(arg_name: str, value: str | None) -> tuple[float, float, float] | None:
     """Fail fast on a malformed --cube_pos/--bowl_pos before paying for Kit's
-    ~30s+ boot below, same reasoning as the calibration-file checks above."""
+    ~30s+ boot below, same reasoning as the calibration-file checks above.
+    Returns the parsed (x, y, z) tuple, or None if value is None."""
     if value is None:
-        return
+        return None
     parts = value.split(",")
     if len(parts) != 3:
         print(
@@ -156,14 +195,43 @@ def _validate_vec3_str(arg_name: str, value: str | None) -> None:
         )
         sys.exit(1)
     try:
-        [float(p) for p in parts]
+        return tuple(float(p) for p in parts)
     except ValueError:
         print(f"[ERROR]: --{arg_name} must be numeric 'x,y,z', got: {value!r}", file=sys.stderr)
         sys.exit(1)
 
 
-_validate_vec3_str("cube_pos", args_cli.cube_pos)
-_validate_vec3_str("bowl_pos", args_cli.bowl_pos)
+_CLI_CUBE_POS = _parse_vec3_str("cube_pos", args_cli.cube_pos)
+_CLI_BOWL_POS = _parse_vec3_str("bowl_pos", args_cli.bowl_pos)
+
+# Load + validate the fixed-workspace layout (pure config/math, no
+# isaacsim/omni import -- see utils/fixed_workspace.py) and resolve the
+# final cube/bowl poses now, before Kit boots, so a bad --layout or
+# --cube_yaw_deg/--bowl_yaw_deg fails fast like the checks above instead of
+# surfacing only after the ~30s+ Kit boot. Precedence: CLI override (--
+# cube_pos/--bowl_pos/--cube_yaw_deg/--bowl_yaw_deg) > --layout JSON >
+# in-code legacy default (fixed_workspace.default_layout(), which
+# reproduces this file's old hardcoded REAL_CUBE_POS/REAL_BOWL_POS/
+# ROBOT_POS constants exactly).
+try:
+    if args_cli.layout is not None:
+        WORKSPACE_LAYOUT = fixed_workspace.load_layout(args_cli.layout)
+    else:
+        WORKSPACE_LAYOUT = fixed_workspace.default_layout()
+    if args_cli.cube_yaw_deg is not None:
+        fixed_workspace.validate_yaw_deg(args_cli.cube_yaw_deg, "--cube_yaw_deg")
+    if args_cli.bowl_yaw_deg is not None:
+        fixed_workspace.validate_yaw_deg(args_cli.bowl_yaw_deg, "--bowl_yaw_deg")
+except fixed_workspace.LayoutError as exc:
+    print(f"[ERROR]: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+RESOLVED_CUBE_POSE = fixed_workspace.resolve_cube_pose(
+    WORKSPACE_LAYOUT, cli_pos_xyz_m=_CLI_CUBE_POS, cli_yaw_deg=args_cli.cube_yaw_deg
+)
+RESOLVED_BOWL_POSE = fixed_workspace.resolve_bowl_pose(
+    WORKSPACE_LAYOUT, cli_pos_xyz_m=_CLI_BOWL_POS, cli_yaw_deg=args_cli.bowl_yaw_deg
+)
 
 # Must happen before any `lerobot` import (including transitively, via
 # sim_to_real_so101.utils.lerobot_interface below) -- lerobot.utils.constants
@@ -184,7 +252,11 @@ from pxr import Gf, UsdPhysics  # noqa: E402
 from sim_to_real_so101.utils.keyboard import KeyboardControl  # noqa: E402
 from sim_to_real_so101.utils.lerobot_interface import LeRobotSO101Interface  # noqa: E402
 from sim_to_real_so101.utils.physics_material import apply_friction_material  # noqa: E402
-from sim_to_real_so101.utils.scene_reset import restore_prim_pose, snapshot_xform_ops  # noqa: E402
+from sim_to_real_so101.utils.scene_reset import (  # noqa: E402
+    ensure_translate_orient_ops,
+    restore_prim_pose,
+    snapshot_xform_ops,
+)
 from sim_to_real_so101.utils.version_banner import print_simulator_version_banner  # noqa: E402
 
 print_simulator_version_banner()
@@ -194,11 +266,17 @@ REAL_TO_SIM_USD = os.path.join(_DEMO_DIR, "real-to-sim.usd")
 
 ROBOT_PRIM_PATH = "/World/SO_ARM101_USD"
 AWS_CUBE_PRIM_PATH = "/World/AWSBuilderCube"
-AWS_CUBE_MASS_KG = 0.05
 # See keyboard_agent_raw_isaacsim.py's identical constant -- friction is a
 # collision-shape property (PhysicsMaterialAPI), not a rigid-body property.
 AWS_CUBE_COLLISION_MESH_PATH = "/World/AWSBuilderCube/Geometry/AWSBuilderCube_Geo"
 PAPER_BOWL_PRIM_PATH = "/World/PaperBowl"
+
+# Cube/bowl pose, size, and mass now come from WORKSPACE_LAYOUT/
+# RESOLVED_CUBE_POSE/RESOLVED_BOWL_POSE (resolved above, before Kit boot --
+# see utils/fixed_workspace.py) instead of the hardcoded REAL_CUBE_POS/
+# REAL_BOWL_POS/AWS_CUBE_MASS_KG world-frame constants this file used to
+# carry directly.
+TABLE_CONTACT_WARN_TOLERANCE_M = 0.005
 
 # See keyboard_agent_raw_isaacsim.py -- gripper pad collision shapes.
 GRIPPER_COLLISION_PATH = "/World/SO_ARM101_USD/gripper/collisions"
@@ -217,20 +295,6 @@ AWS_CUBE_RESTITUTION = 0.0
 GRIPPER_STATIC_FRICTION = 0.9
 GRIPPER_DYNAMIC_FRICTION = 0.8
 GRIPPER_RESTITUTION = 0.0
-
-# Exact xformOp:translate / xformOp:orient authored on /World/SO_ARM101_USD
-# in real-to-sim.usd -- see keyboard_agent_raw_isaacsim.py's identical
-# constant for the full derivation.
-ROBOT_POS = Gf.Vec3f(0.0, 0.3, 0.72)
-
-# Measured from the real workspace on 2026-08-19 (tape measure from the
-# robot base's two feet, see docs/object-pose-mirroring-plan.md's successor
-# plan for the d/x -> world conversion). Re-measure and update if the
-# table/robot/objects move -- these are a one-time snapshot, not tracked.
-# Bowl X sign was a provisional guess pending a live-viewport check; confirm
-# it still matches before trusting it further.
-REAL_CUBE_POS = Gf.Vec3d(0.0, 0.047, 0.7754)
-REAL_BOWL_POS = Gf.Vec3d(0.153, 0.047, 0.7500)
 
 # Isaac-Lab-tuned actuator gains, used AS-IS unconverted on the raw
 # PhysicsDriveAPI attributes -- see keyboard_agent_raw_isaacsim.py's
@@ -262,12 +326,71 @@ RAD_TO_DEG = 180.0 / 3.141592653589793
 # "no per-tick spam" requirement.
 STATS_PRINT_INTERVAL_S = 5.0
 
+# Follower startup sync (dual-teleop-sim-and-follower-plan.md's "Follower
+# robot safety" follow-up): without this, connecting a real follower snaps
+# it straight to the leader's current position with no ramp the instant
+# send_action() is first called -- SO101FollowerConfig.max_relative_target
+# defaults to None (confirmed: LeRobotSO101Interface.make_cfg() never sets
+# it), so nothing in lerobot itself limits that first jump. Ramping over a
+# short, fixed duration instead is a conservative mitigation, not a
+# guarantee -- it does not replace positioning the physical leader near the
+# follower's actual pose before connecting.
+FOLLOWER_STARTUP_SYNC_DURATION_S = 1.5
+FOLLOWER_STARTUP_SYNC_STEPS = 45
+
+
+def _fmt_xyz(xyz) -> str:
+    return f"({xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f})"
+
+
+def _ramp_follower_to_leader_start(follower_robot, leader_action: dict) -> None:
+    """Gradually move a just-connected follower from its current pose to the
+    leader's current reading, instead of send_action()'s usual instant
+    snap-to-target on the very first call. Read follower initial state ->
+    read leader target -> interpolate -> hand off to normal per-tick
+    mirroring, per the "Follower robot safety" requirement. Never raises --
+    any failure here falls back to today's snap behavior rather than
+    destabilizing the demo start."""
+    try:
+        obs = follower_robot.get_observation()
+    except Exception as exc:
+        print(f"[WARN]: Follower startup sync skipped (get_observation failed: {exc}) -- falling back to an instant snap.")
+        return
+
+    start_pos = {k: v for k, v in obs.items() if k.endswith(".pos")}
+    target_pos = {k: v for k, v in leader_action.items() if k.endswith(".pos")}
+    common_keys = sorted(k for k in target_pos if k in start_pos)
+    if not common_keys:
+        print("[WARN]: Follower startup sync skipped (no shared '.pos' keys between observation and action).")
+        return
+
+    max_delta = max(abs(target_pos[k] - start_pos[k]) for k in common_keys)
+    print(
+        f"[INFO]: Follower startup sync: max joint delta {max_delta:.1f}, ramping over "
+        f"{FOLLOWER_STARTUP_SYNC_DURATION_S:.1f}s before normal mirroring begins."
+    )
+    step_dt = FOLLOWER_STARTUP_SYNC_DURATION_S / FOLLOWER_STARTUP_SYNC_STEPS
+    for step in range(1, FOLLOWER_STARTUP_SYNC_STEPS + 1):
+        alpha = step / FOLLOWER_STARTUP_SYNC_STEPS
+        interpolated = {k: start_pos[k] + alpha * (target_pos[k] - start_pos[k]) for k in common_keys}
+        try:
+            follower_robot.send_action(interpolated)
+        except Exception as exc:
+            print(f"[WARN]: Follower startup sync aborted mid-ramp ({exc}) -- entering normal mirroring now.")
+            return
+        time.sleep(step_dt)
+    print("[INFO]: Follower startup sync complete, entering normal mirroring.")
+
 
 def main():
     usd_context = omni.usd.get_context()
     usd_context.open_stage(REAL_TO_SIM_USD)
     simulation_app.update()
     stage = usd_context.get_stage()
+
+    robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
+    if not robot_prim.IsValid():
+        raise RuntimeError(f"Expected prim not found: {ROBOT_PRIM_PATH}")
 
     # See keyboard_agent_raw_isaacsim.py -- the raw file authors no
     # RigidBodyAPI/MassAPI on the cube.
@@ -277,7 +400,8 @@ def main():
     if not cube_prim.HasAPI(UsdPhysics.RigidBodyAPI):
         UsdPhysics.RigidBodyAPI.Apply(cube_prim)
     if not cube_prim.HasAPI(UsdPhysics.MassAPI):
-        UsdPhysics.MassAPI.Apply(cube_prim).CreateMassAttr(AWS_CUBE_MASS_KG)
+        UsdPhysics.MassAPI.Apply(cube_prim)
+    UsdPhysics.MassAPI(cube_prim).CreateMassAttr(WORKSPACE_LAYOUT.cube.mass_kg)
 
     cube_collision_mesh = stage.GetPrimAtPath(AWS_CUBE_COLLISION_MESH_PATH)
     if not cube_collision_mesh.IsValid():
@@ -285,6 +409,19 @@ def main():
     apply_friction_material(
         cube_collision_mesh, AWS_CUBE_STATIC_FRICTION, AWS_CUBE_DYNAMIC_FRICTION, AWS_CUBE_RESTITUTION
     )
+
+    # Correct the cube's geometry to the real cube's measured ~5.6cm side
+    # length -- real-to-sim.usd's AWSBuilderCube_Geo mesh was authored at
+    # 5cm (confirmed by direct inspection). AWSBuilderCube_Geo is a single
+    # Mesh prim serving as *both* the visual and the collision shape
+    # (PhysicsCollisionAPI + PhysicsMeshCollisionAPI applied directly to
+    # it), so scaling its existing xformOp:scale corrects both together --
+    # never just the visual mesh, and never leaves the collision shape at a
+    # different size than what's rendered. Applied at runtime (like the
+    # RigidBodyAPI/mass/friction patches above), not by hand-editing the
+    # checked-in USD asset.
+    cube_scale = tuple(s / fixed_workspace.AUTHORED_CUBE_GEO_SIZE_M for s in WORKSPACE_LAYOUT.cube.size_m)
+    cube_collision_mesh.GetAttribute("xformOp:scale").Set(Gf.Vec3f(*cube_scale))
 
     for collision_path in (GRIPPER_COLLISION_PATH, JAW_COLLISION_PATH):
         collision_prim = stage.GetPrimAtPath(collision_path)
@@ -298,22 +435,58 @@ def main():
     if not bowl_prim.IsValid():
         raise RuntimeError(f"Expected prim not found: {PAPER_BOWL_PRIM_PATH}")
 
-    # Override the cube/bowl's starting position with the real measured pose
-    # (or a --cube_pos/--bowl_pos CLI override) before anything snapshots or
-    # plays -- both prims already author exactly one xformOp:translate, so no
-    # ordered-xformOp search is needed, unlike the removed camera-tracking
-    # code this replaces.
-    def _parse_vec3(value: str) -> Gf.Vec3d:
-        x, y, z = (float(p) for p in value.split(","))
-        return Gf.Vec3d(x, y, z)
+    # Apply the resolved cube/bowl world pose (layout JSON, base-frame
+    # math, and any --cube_pos/--bowl_pos/--cube_yaw_deg/--bowl_yaw_deg CLI
+    # override -- all already resolved into RESOLVED_CUBE_POSE/
+    # RESOLVED_BOWL_POSE before Kit booted) before anything snapshots or
+    # plays. ensure_translate_orient_ops adds an xformOp:orient if one isn't
+    # already authored (AWSBuilderCube has none today) without duplicating
+    # or reordering whatever ops already exist.
+    cube_translate_attr, cube_orient_attr = ensure_translate_orient_ops(cube_prim)
+    bowl_translate_attr, bowl_orient_attr = ensure_translate_orient_ops(bowl_prim)
 
-    cube_pos = _parse_vec3(args_cli.cube_pos) if args_cli.cube_pos else REAL_CUBE_POS
-    bowl_pos = _parse_vec3(args_cli.bowl_pos) if args_cli.bowl_pos else REAL_BOWL_POS
-    cube_prim.GetAttribute("xformOp:translate").Set(cube_pos)
-    bowl_prim.GetAttribute("xformOp:translate").Set(bowl_pos)
+    cube_translate_attr.Set(Gf.Vec3d(*RESOLVED_CUBE_POSE.xyz_world_m))
+    cube_orient_attr.Set(Gf.Quatf(*fixed_workspace.yaw_deg_to_quat_wxyz(RESOLVED_CUBE_POSE.yaw_world_deg)))
+    bowl_translate_attr.Set(Gf.Vec3d(*RESOLVED_BOWL_POSE.xyz_world_m))
+    bowl_orient_attr.Set(Gf.Quatf(*fixed_workspace.yaw_deg_to_quat_wxyz(RESOLVED_BOWL_POSE.yaw_world_deg)))
 
-    # Captured before the timeline plays, so this is each prim's *measured*
-    # starting pose (set just above) -- restored on 'R'.
+    # Consistency check only -- never auto-corrects a configured pose (see
+    # utils/fixed_workspace.py's cube_table_contact_gap_m docstring).
+    gap_m = fixed_workspace.cube_table_contact_gap_m(WORKSPACE_LAYOUT, RESOLVED_CUBE_POSE.xyz_world_m[2])
+    if abs(gap_m) > TABLE_CONTACT_WARN_TOLERANCE_M:
+        print(
+            f"[WARN]: Cube world Z ({RESOLVED_CUBE_POSE.xyz_world_m[2]:.4f}m) is {gap_m * 1000.0:+.1f}mm "
+            f"off the table surface (table_surface_z_world_m={WORKSPACE_LAYOUT.table_surface_z_world_m:.4f} "
+            f"+ cube.size_m[2]/2={WORKSPACE_LAYOUT.cube.size_m[2] / 2.0:.4f}) -- not auto-corrected. "
+            "Re-measure cube.xyz_base_m, or set cube.rest_on_table=true, if this isn't intentional."
+        )
+    if abs(WORKSPACE_LAYOUT.robot_world.yaw_deg) > 1e-9:
+        print(
+            f"[WARN]: robot_world.yaw_deg={WORKSPACE_LAYOUT.robot_world.yaw_deg} is set -- this build only "
+            "applies it to cube/bowl base-frame math. The simulated robot's root_joint mount is NOT yet "
+            "rotated to match (known limitation, see docs/hardcoded-real2sim-implementation-receipt.md)."
+        )
+
+    print(f"[LAYOUT] frame={WORKSPACE_LAYOUT.frame}")
+    print(f"[LAYOUT] source={WORKSPACE_LAYOUT.source}")
+    print(
+        f"[LAYOUT] robot_world_xyz={_fmt_xyz(WORKSPACE_LAYOUT.robot_world.xyz_m)} "
+        f"yaw_deg={WORKSPACE_LAYOUT.robot_world.yaw_deg:.2f}"
+    )
+    cube_base_str = _fmt_xyz(RESOLVED_CUBE_POSE.xyz_base_m) if RESOLVED_CUBE_POSE.xyz_base_m else "N/A (--cube_pos world override)"
+    print(f"[LAYOUT] cube_base_xyz={cube_base_str}")
+    print(f"[LAYOUT] cube_world_xyz={_fmt_xyz(RESOLVED_CUBE_POSE.xyz_world_m)}")
+    print(f"[LAYOUT] cube_yaw_deg={RESOLVED_CUBE_POSE.yaw_world_deg:.2f} (source={RESOLVED_CUBE_POSE.yaw_source})")
+    bowl_base_str = _fmt_xyz(RESOLVED_BOWL_POSE.xyz_base_m) if RESOLVED_BOWL_POSE.xyz_base_m else "N/A (--bowl_pos world override)"
+    print(f"[LAYOUT] bowl_base_xyz={bowl_base_str}")
+    print(f"[LAYOUT] bowl_world_xyz={_fmt_xyz(RESOLVED_BOWL_POSE.xyz_world_m)}")
+    print(f"[LAYOUT] bowl_yaw_deg={RESOLVED_BOWL_POSE.yaw_world_deg:.2f} (source={RESOLVED_BOWL_POSE.yaw_source})")
+    print("[LAYOUT] cube_dynamic=True")
+    print("[LAYOUT] bowl_static=True")
+
+    # Captured after the pose above is applied and before the timeline
+    # plays, so this is each prim's *configured* starting pose (translate
+    # and orient both) -- restored, along with zeroed cube velocity, on 'R'.
     cube_orig_pose = snapshot_xform_ops(cube_prim)
     bowl_orig_pose = snapshot_xform_ops(bowl_prim)
 
@@ -323,7 +496,7 @@ def main():
     if not root_joint_prim.IsValid():
         raise RuntimeError(f"Expected prim not found: {ROBOT_PRIM_PATH}/root_joint")
     local_rot1 = root_joint_prim.GetAttribute("physics:localRot1").Get()
-    root_joint_prim.GetAttribute("physics:localPos0").Set(ROBOT_POS)
+    root_joint_prim.GetAttribute("physics:localPos0").Set(Gf.Vec3f(*WORKSPACE_LAYOUT.robot_world.xyz_m))
     root_joint_prim.GetAttribute("physics:localRot0").Set(local_rot1)
 
     # Apply the tuned actuator gains and cache each joint's limits/attributes.
@@ -394,6 +567,13 @@ def main():
                 "given --follower_port, and not already held open by another process."
             ) from exc
         print(f"[INFO]: Follower arm connected: port={args_cli.follower_port} id={args_cli.follower_robot_id}")
+
+        try:
+            _startup_leader_action = robot_iface.robot.get_action()
+        except Exception as exc:
+            print(f"[WARN]: Could not read the leader for follower startup sync ({exc}) -- skipping the ramp.")
+        else:
+            _ramp_follower_to_leader_start(follower_iface.robot, _startup_leader_action)
 
     keyboard_control = KeyboardControl()
 

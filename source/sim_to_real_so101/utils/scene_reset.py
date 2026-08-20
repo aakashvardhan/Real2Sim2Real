@@ -29,6 +29,32 @@ def snapshot_xform_ops(prim: Usd.Prim) -> list[tuple]:
     return [(op, op.Get()) for op in UsdGeom.Xformable(prim).GetOrderedXformOps()]
 
 
+def ensure_translate_orient_ops(prim: Usd.Prim) -> tuple[Usd.Attribute, Usd.Attribute]:
+    """Return (translate_attr, orient_attr) for `prim`, adding a
+    xformOp:orient if one isn't already authored -- without touching
+    whatever ops already exist or duplicating one that does.
+
+    Some prims in real-to-sim.usd only author xformOp:translate (e.g.
+    AWSBuilderCube, confirmed by direct inspection); others already have
+    translate+orient+scale (e.g. PaperBowl). Adding an orient op when
+    missing appends it after the existing ops in xformOpOrder -- since
+    translate is always first here, the result is [translate, orient, ...],
+    i.e. the composed local transform is T * R (rotate the prim about its
+    own origin, then translate to its world position), matching the
+    convention PaperBowl already uses.
+    """
+    xformable = UsdGeom.Xformable(prim)
+    ops = xformable.GetOrderedXformOps()
+    translate_op = next((op for op in ops if op.GetOpType() == UsdGeom.XformOp.TypeTranslate), None)
+    if translate_op is None:
+        raise RuntimeError(f"{prim.GetPath()} has no xformOp:translate -- cannot safely apply a pose to it")
+    orient_op = next((op for op in ops if op.GetOpType() == UsdGeom.XformOp.TypeOrient), None)
+    if orient_op is None:
+        orient_op = xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionFloat)
+        orient_op.Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    return translate_op.GetAttr(), orient_op.GetAttr()
+
+
 def restore_prim_pose(prim: Usd.Prim, snapshot: list[tuple], zero_velocity: bool = False) -> None:
     """Restore a prim's xformOps from a snapshot taken by snapshot_xform_ops.
 
