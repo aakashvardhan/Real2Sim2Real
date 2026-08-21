@@ -282,18 +282,16 @@ TABLE_CONTACT_WARN_TOLERANCE_M = 0.005
 GRIPPER_COLLISION_PATH = "/World/SO_ARM101_USD/gripper/collisions"
 JAW_COLLISION_PATH = "/World/SO_ARM101_USD/jaw/collisions"
 
-# See keyboard_agent_raw_isaacsim.py -- rigid PVC-like friction for the cube,
-# chosen over PP (more slippery) since the goal is to stop the cube slipping
-# out of the gripper. Neither cube nor gripper had any physics material
-# before this.
-AWS_CUBE_STATIC_FRICTION = 0.5
-AWS_CUBE_DYNAMIC_FRICTION = 0.45
+# See keyboard_agent_raw_isaacsim.py -- rigid PVC-like friction for the cube
+# (matches PhysicsMaterialAPI on real-to-sim.usd's AWSBuilderCube_Geo).
+AWS_CUBE_STATIC_FRICTION = 0.45
+AWS_CUBE_DYNAMIC_FRICTION = 0.40
 AWS_CUBE_RESTITUTION = 0.0
 
-# See keyboard_agent_raw_isaacsim.py -- rubber/silicone-like friction for the
-# gripper pads, higher than the cube's.
-GRIPPER_STATIC_FRICTION = 0.9
-GRIPPER_DYNAMIC_FRICTION = 0.8
+# See keyboard_agent_raw_isaacsim.py -- FDM 3D-printed PLA/PETG friction for
+# the jaw/gripper pads (matches PhysicsMaterialAPI on real-to-sim.usd).
+GRIPPER_STATIC_FRICTION = 0.40
+GRIPPER_DYNAMIC_FRICTION = 0.35
 GRIPPER_RESTITUTION = 0.0
 
 # Isaac-Lab-tuned actuator gains, used AS-IS unconverted on the raw
@@ -311,11 +309,12 @@ JOINT_GAINS = {
     "Elbow": dict(stiffness=25, damping=0.7, effort_limit=30),
     "Wrist_Pitch": dict(stiffness=12, damping=0.5, effort_limit=30),
     "Wrist_Roll": dict(stiffness=7, damping=0.5, effort_limit=30),
-    # See keyboard_agent_raw_isaacsim.py's identical constant for the full
-    # empirical justification -- effort_limit=30 (untuned for load) let the
-    # jaw destabilize the contact solve and eject the cube when driven to
-    # full closure against it. effort_limit=3 is still ~250x this 0.05kg
-    # cube's actual holding-force requirement, so grip strength isn't lost.
+    # effort_limit=3 (not 30): commanding full close against AWSBuilderCube is
+    # an unreachable target (pads stop at cube width), so the PD drive saturates
+    # at maxForce every tick. 30 N*m ejects the cube; 3 N*m still grips (~250x
+    # the holding torque a 50g cube needs) without launching it. Same value as
+    # keyboard_agent_raw_isaacsim.py / replay_act_dataset_to_sim.py /
+    # test_grasp_dynamics.py.
     "Jaw": dict(stiffness=4, damping=0.3, effort_limit=3),
 }
 JOINT_ORDER = list(JOINT_GAINS.keys())
@@ -410,9 +409,9 @@ def main():
         cube_collision_mesh, AWS_CUBE_STATIC_FRICTION, AWS_CUBE_DYNAMIC_FRICTION, AWS_CUBE_RESTITUTION
     )
 
-    # Correct the cube's geometry to the real cube's measured ~5.6cm side
-    # length -- real-to-sim.usd's AWSBuilderCube_Geo mesh was authored at
-    # 5cm (confirmed by direct inspection). AWSBuilderCube_Geo is a single
+    # Correct the cube's geometry to the real cube's 5.3cm side length --
+    # real-to-sim.usd's AWSBuilderCube_Geo mesh was authored at 5cm
+    # (confirmed by direct inspection). AWSBuilderCube_Geo is a single
     # Mesh prim serving as *both* the visual and the collision shape
     # (PhysicsCollisionAPI + PhysicsMeshCollisionAPI applied directly to
     # it), so scaling its existing xformOp:scale corrects both together --

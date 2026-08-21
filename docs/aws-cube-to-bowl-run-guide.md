@@ -146,7 +146,7 @@ isaacsim/omni import — unit-tested independently of Isaac Sim, see
    directly (don't set both an explicit nonzero Z *and* `rest_on_table:
    true` — the script rejects that as ambiguous).
 4. Same for the bowl's **table-contact point** -> `bowl.xyz_base_m`.
-5. Measure the real cube's actual side length (expected ~0.056m, not the
+5. Measure the real cube's actual side length (expected ~0.053m / 5.3cm, not the
    0.05m originally authored in `real-to-sim.usd`) -> `cube.size_m`.
 6. Fill in `calibration/workspaces/aws_cube_bowl_fixed.json` (or a copy of
    it) with these numbers. The checked-in file's values are a **pure
@@ -166,7 +166,7 @@ isaacsim/omni import — unit-tested independently of Isaac Sim, see
   "cube": {
     "xyz_base_m": [0.0, -0.253, 0.0554],
     "yaw_deg": 0.0,
-    "size_m": [0.056, 0.056, 0.056],
+    "size_m": [0.053, 0.053, 0.053],
     "mass_kg": 0.05,
     "rest_on_table": false
   },

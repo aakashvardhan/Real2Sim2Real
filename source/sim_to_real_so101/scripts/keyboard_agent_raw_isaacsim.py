@@ -94,21 +94,17 @@ PAPER_BOWL_PRIM_PATH = "/World/PaperBowl"
 GRIPPER_COLLISION_PATH = "/World/SO_ARM101_USD/gripper/collisions"
 JAW_COLLISION_PATH = "/World/SO_ARM101_USD/jaw/collisions"
 
-# Rigid PVC-like friction for the cube (real cube/gripper had no physics
-# material at all before this -- confirmed via direct inspection of
-# real-to-sim.usd, so both were silently running on PhysX's default 0.5/0.5
-# material). PP was the other option considered -- lower friction
-# (~0.3/0.25), more slippery -- PVC chosen since the goal is to stop the cube
-# slipping out of the gripper.
-AWS_CUBE_STATIC_FRICTION = 0.5
-AWS_CUBE_DYNAMIC_FRICTION = 0.45
+# Rigid PVC-like friction for the cube (typical dry μs ~0.4–0.5, μk ~0.35–0.40).
+# Matches PhysicsMaterialAPI authored on real-to-sim.usd's AWSBuilderCube_Geo.
+AWS_CUBE_STATIC_FRICTION = 0.45
+AWS_CUBE_DYNAMIC_FRICTION = 0.40
 AWS_CUBE_RESTITUTION = 0.0
 
-# Rubber/silicone-like friction for the gripper pads -- higher than the
-# cube's, matching how most real grippers use a grippy pad material even when
-# the rest of the gripper body is plastic.
-GRIPPER_STATIC_FRICTION = 0.9
-GRIPPER_DYNAMIC_FRICTION = 0.8
+# FDM 3D-printed PLA/PETG friction for the jaw/gripper pads (physical SO-ARM101
+# parts) -- typical dry μs ~0.35–0.40, μk ~0.25–0.35. Matches PhysicsMaterialAPI
+# authored on real-to-sim.usd's gripper/jaw collision prims.
+GRIPPER_STATIC_FRICTION = 0.40
+GRIPPER_DYNAMIC_FRICTION = 0.35
 GRIPPER_RESTITUTION = 0.0
 
 # Exact xformOp:translate / xformOp:orient authored on /World/SO_ARM101_USD

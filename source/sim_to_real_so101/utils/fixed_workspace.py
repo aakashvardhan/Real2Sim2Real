@@ -370,14 +370,12 @@ LEGACY_CUBE_WORLD_POS: Vec3 = (0.0, 0.047, 0.7754)
 LEGACY_BOWL_WORLD_POS: Vec3 = (0.153, 0.047, 0.7500)
 LEGACY_TABLE_SURFACE_Z_WORLD: float = 0.7504
 LEGACY_CUBE_MASS_KG: float = 0.05
-# Real cube measures ~0.056m (measured 2026-08-20, superseding an earlier
-# ~0.057m estimate in docs/object-pose-mirroring-plan.md); real-to-sim.usd's
-# AWSBuilderCube_Geo mesh was authored at 0.05m (confirmed by direct
-# inspection: 8 points at exactly +/-0.025 on every axis) -- corrected here,
-# applied at runtime as a uniform scale on that mesh's existing
-# xformOp:scale (see AUTHORED_CUBE_GEO_SIZE_M below), not by hand-editing
-# the checked-in USD asset.
-LEGACY_CUBE_SIZE_M: Vec3 = (0.056, 0.056, 0.056)
+# Real cube side length 0.053m (5.3cm). real-to-sim.usd's AWSBuilderCube_Geo
+# mesh was authored at 0.05m (confirmed by direct inspection: 8 points at
+# exactly +/-0.025 on every axis) -- corrected here, applied at runtime as a
+# uniform scale on that mesh's existing xformOp:scale (see
+# AUTHORED_CUBE_GEO_SIZE_M below), not by hand-editing the checked-in USD asset.
+LEGACY_CUBE_SIZE_M: Vec3 = (0.053, 0.053, 0.053)
 
 # The cube geometry's authored (pre-correction) side length in
 # real-to-sim.usd, used only to compute the runtime scale factor

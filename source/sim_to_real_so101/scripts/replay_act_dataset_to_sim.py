@@ -217,13 +217,13 @@ PAPER_BOWL_PRIM_PATH = "/World/PaperBowl"
 GRIPPER_COLLISION_PATH = "/World/SO_ARM101_USD/gripper/collisions"
 JAW_COLLISION_PATH = "/World/SO_ARM101_USD/jaw/collisions"
 
-# Same friction tuning as leader_arm_teleop_raw_isaacsim.py -- see that
-# file's identical constants for the empirical justification.
-AWS_CUBE_STATIC_FRICTION = 0.5
-AWS_CUBE_DYNAMIC_FRICTION = 0.45
+# Same friction tuning as leader_arm_teleop_raw_isaacsim.py -- PVC cube +
+# 3D-printed jaw/gripper (matches PhysicsMaterialAPI on real-to-sim.usd).
+AWS_CUBE_STATIC_FRICTION = 0.45
+AWS_CUBE_DYNAMIC_FRICTION = 0.40
 AWS_CUBE_RESTITUTION = 0.0
-GRIPPER_STATIC_FRICTION = 0.9
-GRIPPER_DYNAMIC_FRICTION = 0.8
+GRIPPER_STATIC_FRICTION = 0.40
+GRIPPER_DYNAMIC_FRICTION = 0.35
 GRIPPER_RESTITUTION = 0.0
 
 ROBOT_POS = Gf.Vec3f(0.0, 0.3, 0.72)
