@@ -377,54 +377,16 @@ def main():
     focus_slot = LeRobotSO101Interface.SO101_JOINT_ORDER.index(joint_key)
     joint_names = [k.split(".")[0] for k in LeRobotSO101Interface.SO101_JOINT_ORDER]
 
-    usd_context = omni.usd.get_context()
-    usd_context.open_stage(REAL_TO_SIM_USD)
-    simulation_app.update()
-    stage = usd_context.get_stage()
-
-    robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
-    if not robot_prim.IsValid():
-        raise RuntimeError(f"Expected prim not found: {ROBOT_PRIM_PATH}")
-
-    # Not optional -- root_joint's body0 binds to the physics scene's literal
-    # origin rather than the ancestor Xform's position, and leaving it
-    # unpatched drives the DOF readings this script exists to print to ~1e10.
-    root_joint_prim = stage.GetPrimAtPath(f"{ROBOT_PRIM_PATH}/root_joint")
-    if not root_joint_prim.IsValid():
-        raise RuntimeError(f"Expected prim not found: {ROBOT_PRIM_PATH}/root_joint")
-    local_rot1 = root_joint_prim.GetAttribute("physics:localRot1").Get()
-    root_joint_prim.GetAttribute("physics:localPos0").Set(Gf.Vec3f(*WORKSPACE_LAYOUT.robot_world.xyz_m))
-    root_joint_prim.GetAttribute("physics:localRot0").Set(local_rot1)
-
-    joints = {}
-    for usd_joint_name, gains in JOINT_GAINS.items():
-        joint_prim = stage.GetPrimAtPath(f"{ROBOT_PRIM_PATH}/joints/{usd_joint_name}")
-        if not joint_prim.IsValid():
-            raise RuntimeError(f"Expected joint prim not found: {usd_joint_name}")
-        joint_prim.GetAttribute("drive:angular:physics:stiffness").Set(float(gains["stiffness"]))
-        joint_prim.GetAttribute("drive:angular:physics:damping").Set(float(gains["damping"]))
-        joint_prim.GetAttribute("drive:angular:physics:maxForce").Set(float(gains["effort_limit"]))
-        joints[usd_joint_name] = {
-            "target_attr": joint_prim.GetAttribute("drive:angular:physics:targetPosition"),
-            "lower": joint_prim.GetAttribute("physics:lowerLimit").Get(),
-            "upper": joint_prim.GetAttribute("physics:upperLimit").Get(),
-        }
-
-    timeline = omni.timeline.get_timeline_interface()
-    timeline.play()
-    simulation_app.update()
-
-    articulation = Articulation(ROBOT_PRIM_PATH)
-    for _ in range(max(1, args_cli.settle_steps)):
-        simulation_app.update()
-    if not articulation.valid or not articulation.is_physics_tensor_entity_valid():
-        raise RuntimeError(
-            f"Articulation at {ROBOT_PRIM_PATH} never became a valid PhysX tensor entity -- try a larger "
-            "--settle_steps, and check the timeline is actually playing."
-        )
-    dof_indices = _resolve_dof_indices(articulation)
-    print(f"[INFO]: articulation DOFs: {list(articulation.dof_names)}")
-
+    # Arm connections happen BEFORE any scene/physics/rendering setup below.
+    # Root-caused in leader_arm_teleop_raw_isaacsim.py (2026-08-24, see its
+    # main() comment): follower.connect()'s burst of ~42 rapid serial writes
+    # silently kills the whole Kit process with no Python traceback when it
+    # runs while the USD stage is loaded and physics is playing -- reproduced
+    # identically here (this script is even busier at connect time than that
+    # one was: stage loaded, root_joint patched, physics playing, AND 30
+    # articulation settle steps already ticked). Connecting first, while Kit
+    # is idle, avoids the contention.
+    #
     # Leader -- the single command source for both followers.
     leader_iface = LeRobotSO101Interface(
         device="cpu", port=args_cli.port, id=args_cli.robot_id, cameras={}, fps=30, kind="leader"
@@ -472,6 +434,54 @@ def main():
             _ramp_follower_to_leader_start(follower_iface.robot, startup_action)
     else:
         print("[INFO]: --no_follower: comparing the leader command against the sim only.")
+
+    usd_context = omni.usd.get_context()
+    usd_context.open_stage(REAL_TO_SIM_USD)
+    simulation_app.update()
+    stage = usd_context.get_stage()
+
+    robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
+    if not robot_prim.IsValid():
+        raise RuntimeError(f"Expected prim not found: {ROBOT_PRIM_PATH}")
+
+    # Not optional -- root_joint's body0 binds to the physics scene's literal
+    # origin rather than the ancestor Xform's position, and leaving it
+    # unpatched drives the DOF readings this script exists to print to ~1e10.
+    root_joint_prim = stage.GetPrimAtPath(f"{ROBOT_PRIM_PATH}/root_joint")
+    if not root_joint_prim.IsValid():
+        raise RuntimeError(f"Expected prim not found: {ROBOT_PRIM_PATH}/root_joint")
+    local_rot1 = root_joint_prim.GetAttribute("physics:localRot1").Get()
+    root_joint_prim.GetAttribute("physics:localPos0").Set(Gf.Vec3f(*WORKSPACE_LAYOUT.robot_world.xyz_m))
+    root_joint_prim.GetAttribute("physics:localRot0").Set(local_rot1)
+
+    joints = {}
+    for usd_joint_name, gains in JOINT_GAINS.items():
+        joint_prim = stage.GetPrimAtPath(f"{ROBOT_PRIM_PATH}/joints/{usd_joint_name}")
+        if not joint_prim.IsValid():
+            raise RuntimeError(f"Expected joint prim not found: {usd_joint_name}")
+        joint_prim.GetAttribute("drive:angular:physics:stiffness").Set(float(gains["stiffness"]))
+        joint_prim.GetAttribute("drive:angular:physics:damping").Set(float(gains["damping"]))
+        joint_prim.GetAttribute("drive:angular:physics:maxForce").Set(float(gains["effort_limit"]))
+        joints[usd_joint_name] = {
+            "target_attr": joint_prim.GetAttribute("drive:angular:physics:targetPosition"),
+            "lower": joint_prim.GetAttribute("physics:lowerLimit").Get(),
+            "upper": joint_prim.GetAttribute("physics:upperLimit").Get(),
+        }
+
+    timeline = omni.timeline.get_timeline_interface()
+    timeline.play()
+    simulation_app.update()
+
+    articulation = Articulation(ROBOT_PRIM_PATH)
+    for _ in range(max(1, args_cli.settle_steps)):
+        simulation_app.update()
+    if not articulation.valid or not articulation.is_physics_tensor_entity_valid():
+        raise RuntimeError(
+            f"Articulation at {ROBOT_PRIM_PATH} never became a valid PhysX tensor entity -- try a larger "
+            "--settle_steps, and check the timeline is actually playing."
+        )
+    dof_indices = _resolve_dof_indices(articulation)
+    print(f"[INFO]: articulation DOFs: {list(articulation.dof_names)}")
 
     csv_file = None
     csv_writer = None

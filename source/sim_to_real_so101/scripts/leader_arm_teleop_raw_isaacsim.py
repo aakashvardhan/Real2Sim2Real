@@ -82,6 +82,7 @@ _REPO_ROOT_DIR = os.path.dirname(_REPO_SOURCE_DIR)
 # before Kit boots, unlike sim_to_real_so101.utils.keyboard/etc below, which
 # transitively need omni/pxr and are imported only after SimulationApp().
 from sim_to_real_so101.utils import fixed_workspace  # noqa: E402
+from sim_to_real_so101.utils.wrist_roll_alignment import WristRollAlignment  # noqa: E402
 
 parser = argparse.ArgumentParser(description="Raw Isaac Sim SO-101 leader-arm teleop agent (no Isaac Lab).")
 parser.add_argument("--headless", action="store_true", default=False, help="Run without a viewport window.")
@@ -320,6 +321,24 @@ JOINT_GAINS = {
 JOINT_ORDER = list(JOINT_GAINS.keys())
 RAD_TO_DEG = 180.0 / 3.141592653589793
 
+# Wrist-roll leader-to-sim zero-pose alignment (2026-08-24 fix) -- see
+# utils/wrist_roll_alignment.py's module docstring for the full root-cause
+# writeup. Short version: get_mapped_actions_vectorized()'s per-joint scale
+# passes exactly through raw=0 -> 0 deg for every joint, which silently
+# assumes the leader's calibration zero coincides with the USD joint's own
+# authored 0 deg pose. That holds for the other five joints but not for
+# Wrist_Roll (confirmed by direct observation: physical wrist upright vs.
+# simulated wrist rotated ~90 deg at near-zero leader/sim readings), so this
+# applies an explicit, configurable correction to Wrist_Roll ONLY, after the
+# scale and before joint-limit clamping -- every other joint's mapping is
+# unchanged.
+#
+# Defaults to a no-op (matches pre-fix behavior) because the correct value
+# can't be determined from the USD file or calibration JSON alone -- follow
+# utils/wrist_roll_alignment.py's docstring to determine it on real
+# hardware, then set it here.
+WRIST_ROLL_ALIGNMENT = WristRollAlignment(direction_sign=1.0, zero_offset_deg=0.0)
+
 # Phase 2 timing measurement -- how often to flush the tick/send-time summary
 # (see the main loop). Deliberately periodic, not per-tick, per the plan's
 # "no per-tick spam" requirement.
@@ -382,6 +401,69 @@ def _ramp_follower_to_leader_start(follower_robot, leader_action: dict) -> None:
 
 
 def main():
+    # Arm connections happen BEFORE any scene/physics/rendering setup below.
+    # Root-caused via isolate_follower_connect.py / isolate_dual_arm_connect.py /
+    # isolate_kit_dual_arm_connect.py (2026-08-24): the follower's connect()
+    # (~42 rapid serial writes in configure()) silently killed the whole Kit
+    # process with no Python traceback when it ran while the USD stage was
+    # loaded and physics was playing -- reproduced identically with just Kit
+    # booted (no stage) or just both arms connected (no Kit) never failed.
+    # Connecting first, while Kit is idle, avoids whatever contention that
+    # burst of writes hits once the render/physics/sensor pipeline is live.
+    robot_iface = LeRobotSO101Interface(
+        device="cpu",
+        port=args_cli.port,
+        id=args_cli.robot_id,
+        cameras={},
+        fps=30,
+        kind="leader",
+    )
+    try:
+        robot_iface.init_device()
+        robot_iface.connect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to connect to the leader arm on port={args_cli.port} id={args_cli.robot_id}: {exc}. "
+            "Check the arm is powered, plugged into the given --port, and not already held open by "
+            "another process (e.g. a previous run that didn't exit cleanly)."
+        ) from exc
+    connected = True
+
+    # Follower mirror -- only connected when --follower_port is given (see
+    # docs/dual-teleop-sim-and-follower-plan.md Phase 1). device="cuda" per
+    # the plan: this machine has an NVIDIA GPU, unlike the leader interface
+    # above which stays device="cpu" (unchanged, out of scope here).
+    follower_iface = None
+    follower_connected = False
+    follower_send_failed = False
+    if args_cli.follower_port is not None:
+        follower_iface = LeRobotSO101Interface(
+            device="cuda",
+            port=args_cli.follower_port,
+            id=args_cli.follower_robot_id,
+            cameras={},
+            fps=30,
+            kind="follower",
+        )
+        try:
+            follower_iface.init_device()
+            follower_iface.connect()
+            follower_connected = True
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to connect to the follower arm on port={args_cli.follower_port} "
+                f"id={args_cli.follower_robot_id}: {exc}. Check the arm is powered, plugged into the "
+                "given --follower_port, and not already held open by another process."
+            ) from exc
+        print(f"[INFO]: Follower arm connected: port={args_cli.follower_port} id={args_cli.follower_robot_id}")
+
+        try:
+            _startup_leader_action = robot_iface.robot.get_action()
+        except Exception as exc:
+            print(f"[WARN]: Could not read the leader for follower startup sync ({exc}) -- skipping the ramp.")
+        else:
+            _ramp_follower_to_leader_start(follower_iface.robot, _startup_leader_action)
+
     usd_context = omni.usd.get_context()
     usd_context.open_stage(REAL_TO_SIM_USD)
     simulation_app.update()
@@ -520,60 +602,6 @@ def main():
     timeline.play()
     simulation_app.update()
 
-    robot_iface = LeRobotSO101Interface(
-        device="cpu",
-        port=args_cli.port,
-        id=args_cli.robot_id,
-        cameras={},
-        fps=30,
-        kind="leader",
-    )
-    try:
-        robot_iface.init_device()
-        robot_iface.connect()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to connect to the leader arm on port={args_cli.port} id={args_cli.robot_id}: {exc}. "
-            "Check the arm is powered, plugged into the given --port, and not already held open by "
-            "another process (e.g. a previous run that didn't exit cleanly)."
-        ) from exc
-    connected = True
-
-    # Follower mirror -- only connected when --follower_port is given (see
-    # docs/dual-teleop-sim-and-follower-plan.md Phase 1). device="cuda" per
-    # the plan: this machine has an NVIDIA GPU, unlike the leader interface
-    # above which stays device="cpu" (unchanged, out of scope here).
-    follower_iface = None
-    follower_connected = False
-    follower_send_failed = False
-    if args_cli.follower_port is not None:
-        follower_iface = LeRobotSO101Interface(
-            device="cuda",
-            port=args_cli.follower_port,
-            id=args_cli.follower_robot_id,
-            cameras={},
-            fps=30,
-            kind="follower",
-        )
-        try:
-            follower_iface.init_device()
-            follower_iface.connect()
-            follower_connected = True
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to connect to the follower arm on port={args_cli.follower_port} "
-                f"id={args_cli.follower_robot_id}: {exc}. Check the arm is powered, plugged into the "
-                "given --follower_port, and not already held open by another process."
-            ) from exc
-        print(f"[INFO]: Follower arm connected: port={args_cli.follower_port} id={args_cli.follower_robot_id}")
-
-        try:
-            _startup_leader_action = robot_iface.robot.get_action()
-        except Exception as exc:
-            print(f"[WARN]: Could not read the leader for follower startup sync ({exc}) -- skipping the ramp.")
-        else:
-            _ramp_follower_to_leader_start(follower_iface.robot, _startup_leader_action)
-
     keyboard_control = KeyboardControl()
 
     print_simulator_version_banner()
@@ -610,9 +638,17 @@ def main():
             raw_tensor = robot_iface.get_raw_actions_tensor(real_action)
             mapped_deg = robot_iface.get_mapped_actions_vectorized(raw_tensor) * RAD_TO_DEG
 
+            # wrist_roll's alignment-corrected target, captured for the
+            # periodic debug printout below -- every other joint is set from
+            # `mapped_deg` unmodified, exactly as before this fix.
+            wrist_roll_target = None
             for joint_name, target_deg in zip(JOINT_ORDER, mapped_deg.tolist()):
                 info = joints[joint_name]
-                clamped = max(info["lower"], min(info["upper"], target_deg))
+                if joint_name == "Wrist_Roll":
+                    wrist_roll_target = WRIST_ROLL_ALIGNMENT.apply(target_deg, info["lower"], info["upper"])
+                    clamped = wrist_roll_target.clamped_deg
+                else:
+                    clamped = max(info["lower"], min(info["upper"], target_deg))
                 info["target_attr"].Set(clamped)
 
             # Mirror the same leader reading to the real follower, same tick,
@@ -650,6 +686,22 @@ def main():
                     )
                 else:
                     print(f"[INFO]: avg tick={avg_tick_ms:.2f} ms over {tick_count} ticks")
+                # Diagnostic readout for the wrist_roll real-vs-sim alignment
+                # fix (2026-08-24) -- every stage of the pipeline, so a
+                # visual mismatch can be traced to a specific number while
+                # watching the viewport: leader's raw lerobot reading (-100..
+                # 100, NOT degrees despite the name), the SO101_USD_MAPPING-
+                # scaled degree value, the configured direction/offset
+                # correction (WRIST_ROLL_ALIGNMENT above) and what it
+                # produced, and finally the clamped value actually written to
+                # the sim joint drive this tick.
+                _wr_raw = real_action["wrist_roll.pos"]
+                wr = wrist_roll_target
+                print(
+                    f"[INFO]: wrist_roll -- leader raw={_wr_raw:+7.2f}  scaled={wr.scaled_deg:+7.2f} deg  "
+                    f"direction={wr.direction_sign:+.1f}  offset={wr.zero_offset_deg:+7.2f} deg  "
+                    f"unclamped={wr.unclamped_deg:+7.2f} deg  sim target(clamped)={wr.clamped_deg:+7.2f} deg"
+                )
                 tick_count = 0
                 tick_time_total = 0.0
                 send_time_total = 0.0
