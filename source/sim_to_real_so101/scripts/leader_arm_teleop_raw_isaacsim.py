@@ -333,11 +333,17 @@ RAD_TO_DEG = 180.0 / 3.141592653589793
 # scale and before joint-limit clamping -- every other joint's mapping is
 # unchanged.
 #
-# Defaults to a no-op (matches pre-fix behavior) because the correct value
-# can't be determined from the USD file or calibration JSON alone -- follow
-# utils/wrist_roll_alignment.py's docstring to determine it on real
-# hardware, then set it here.
-WRIST_ROLL_ALIGNMENT = WristRollAlignment(direction_sign=1.0, zero_offset_deg=0.0)
+# zero_offset_deg=-90.0 set 2026-08-24 per explicit user request (+90.0 was
+# tried first and changed to -90.0), on top of direction_sign=+1.0 (real and
+# sim confirmed rotating the same side live on hardware -- see the
+# neutral-pose and horizontal-quarter-turn checks in the session that
+# produced this value). NOTE: those same live checks measured offset=0.0 as
+# the matching value at that moment (recalibrated arm); this -90.0 was
+# requested afterward without a re-verified live mismatch behind it. If the
+# simulated wrist looks off by ~90 deg at neutral after this change, that
+# confirms this value was wrong for the current calibration -- revert to
+# 0.0, or re-derive per utils/wrist_roll_alignment.py's docstring.
+WRIST_ROLL_ALIGNMENT = WristRollAlignment(direction_sign=1.0, zero_offset_deg=-90.0)
 
 # Phase 2 timing measurement -- how often to flush the tick/send-time summary
 # (see the main loop). Deliberately periodic, not per-tick, per the plan's
